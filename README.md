@@ -99,3 +99,13 @@ main() print ["Hello, world"] start
 
 ---
 
+Compile with:
+
+gcc -c libxyzrt.c -o libxyzrt.o
+ar rcs libxyzrt.a libxyzrt.o
+
+
+Now -lxyzrt can be linked into programs emitted by your compiler.
+
+
+
