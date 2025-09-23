@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <pthread.h>
 #include <setjmp.h>
+#include <stdio.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -33,6 +34,12 @@ void xyz_pin_to_core(int core);
 
 /* ---------- GPU Coercion Stubs ---------- */
 void xyz_launch_vecadd(float* A,float* B,float* C,int N);
+
+/* ---------- I/O ---------- */
+void xyz_print_int(long v);
+void xyz_print_str(const char* s);
+long xyz_read_int();
+void xyz_read_str(char* buf, size_t max);
 
 #ifdef __cplusplus
 }
