@@ -1097,3 +1097,15 @@ class Inliner:
             return fn.children[1]  # inline block
         return call_node
 
+class CIAM:
+    corrections = {"prnt":"print","pritn":"print"}
+    macros = {"SAFEADD":"( (x)!=null && (y)!=null ? (x)+(y) : 0 )"}
+    def expand(self,node):
+        if node.nodetype=="Ident" and node.value in self.corrections:
+            node.value=self.corrections[node.value]
+        if node.nodetype=="MacroCall" and node.value=="SAFEADD":
+            x,y=node.children
+            return ASTNode("BinaryOp","+",
+                [ASTNode("Var",x.value),ASTNode("Var",y.value)])
+        return node
+
