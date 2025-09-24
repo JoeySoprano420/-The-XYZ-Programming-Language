@@ -116,3 +116,18 @@ sudo make install # installs headers and libs into /usr/local
 
 
 
+🔹 Usage in XYZ Compiler Output
+
+When XYZ generates NASM → ELF binaries, just link with runtime:
+
+(Bash)
+
+gcc program.o -L. -lxyzrt -lpthread -o program
+
+
+
+And in generated code:
+
+extern void xyz_print_int(long);
+extern void xyz_print_str(const char*);
+
