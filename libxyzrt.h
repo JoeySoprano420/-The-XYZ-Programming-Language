@@ -45,4 +45,4 @@ void xyz_read_str(char* buf, size_t max);
 }
 #endif
 
-#endif
+#endif /* LIBXYZRT_H */
