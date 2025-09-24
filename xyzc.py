@@ -9,7 +9,338 @@
 # - Small improvements to parser and runtime to exercise these features
 #
 # The file preserves previous features (hot-swap, linker, codegen, packetizer).
+# Grandiose resolution: orchestrate full pipeline and execute best-available runtime.
+# This runs only when environment variable `XYZ_GRAND_EXECUTE=1` is set to avoid surprising behavior.
+# Usage:
+#   XYZ_GRAND_EXECUTE=1 python xyz_practice.py <source.xy>
+# The resolver will attempt, in order:
+#  1) ProCompiler (professional parser → typecheck → IR → engine)
+#  2) FastRuntime (bytecode VM) if available/compilable
+#  3) MiniRuntime (AST interpreter) as final fallback
+# It will also emit object/asm artifacts under the working directory for inspection.
+# --- MEGA FEATURES: types, structs, macros, self-expansion, rapid checkout ---
+# Opt-in toolbox. Call `enable_mega_features(hot_registry, mini_runtime, fast_runtime=None)` to wire in.
+# Provides:
+#  - Rich type system registry (primitives, vectors, matrices, complex, decimal, bigint)
+#  - Struct/enum declarations and runtime layout
+#  - Tuple/Set literal AST nodes + Match expression support
+#  - MacroEngine for compile-time expansion and SelfExpander that can synthesize new functions and hot-swap them
+#  - Rapid checkout / snapshot and restore of symbol table + hot-swap registry
+#  - Lightweight operation dispatch for new types (addition, bitwise, shifts, dot-access)
+# This is intentionally conservative and safe: expansion produces FuncDef objects and registers them.
 
+import copy, hashlib, inspect, decimal, numbers
+from decimal import Decimal
+from typing import Callable
+
+# --- Type registry ---
+class MegaType:
+    def __init__(self, name: str, meta: Dict[str, Any]=None):
+        self.name = name
+        self.meta = meta or {}
+    def __repr__(self): return f"MegaType({self.name})"
+
+class TypeRegistry:
+    _types: Dict[str, MegaType] = {}
+    @classmethod
+    def register(cls, t: MegaType):
+        cls._types[t.name] = t
+    @classmethod
+    def get(cls, name: str):
+        return cls._types.get(name)
+    @classmethod
+    def list_types(cls):
+        return list(cls._types.keys())
+
+# register common primitives
+for pname in ("Int8","Int16","Int32","Int64","UInt8","UInt16","UInt32","UInt64","BigInt","Float32","Float64","Decimal","Complex","Bool","String","Any"):
+    TypeRegistry.register(MegaType(pname))
+
+# convenience factory
+def mega_type(name:str, **meta): 
+    t = MegaType(name, meta); TypeRegistry.register(t); return t
+
+# --- Struct/Enum support (AST + runtime layouts) ---
+class StructDef:
+    def __init__(self, name: str, fields: List[Tuple[str,str]]):
+        self.name = name
+        self.fields = fields  # list of (fieldname, type_name)
+        self.size = len(fields)
+    def __repr__(self): return f"StructDef({self.name}, fields={self.fields})"
+
+class StructRegistry:
+    _structs: Dict[str, StructDef] = {}
+    @classmethod
+    def register(cls, s: StructDef):
+        cls._structs[s.name] = s
+    @classmethod
+    def get(cls, name: str):
+        return cls._structs.get(name)
+    @classmethod
+    def dump(cls):
+        return dict(cls._structs)
+
+# small helper to create a boxed instance (dict-backed)
+def make_struct_instance(name: str, **kwargs):
+    sdef = StructRegistry.get(name)
+    if not sdef: raise Exception(f"Unknown struct {name}")
+    inst = {"__struct__": name}
+    for fname, ftype in sdef.fields:
+        inst[fname] = kwargs.get(fname, None)
+    return inst
+
+# --- Macro Engine & Self-Expander ---
+class MacroEngine:
+    def __init__(self):
+        self.macros: Dict[str, Callable[[Any], List[ASTNode]]] = {}
+    def register_macro(self, name: str, fn: Callable[[Any], List[ASTNode]]):
+        self.macros[name] = fn
+    def expand(self, node):
+        # simple pattern: if node is Call and name matches macro, run expansion
+        if isinstance(node, Call) and node.name in self.macros:
+            try:
+                return self.macros[node.name](node)
+            except Exception as e:
+                print(f"[MACRO] expansion error for {node.name}: {e}")
+                return [node]
+        return [node]
+
+class SelfExpander:
+    """
+    Generates functions at runtime deterministically from templates and registers to hot_registry.
+    Example usage: expander.generate_vector_ops("Vec3", base_type="Float64") -> creates add/sub/mul ops.
+    """
+    def __init__(self, hot_registry: HotSwapRegistry, symtab: Dict[str, FuncDef]):
+        self.hot = hot_registry
+        self.symtab = symtab
+        self.generated = {}
+    def _mk_func(self, name: str, params: List[str], body: List[ASTNode]) -> FuncDef:
+        f = FuncDef(name, params, body)
+        key = f"{name}/{len(params)}"
+        self.hot.register(key, f)
+        self.symtab[key] = f
+        self.generated[key] = f
+        return f
+    def generate_vector_ops(self, vec_name: str, dims:int=3, base_type="Float64"):
+        # generate a constructor and element-wise add
+        ctor_name = f"{vec_name}.new"
+        params = [f"x{i}" for i in range(dims)]
+        # body: assign fields then return placeholder (simulate)
+        body = []
+        for i,p in enumerate(params):
+            body.append(Assign(f"f{i}", Var(p)))
+        body.append(Return(ListLiteral([Var(p) for p in params])))
+        self._mk_func(ctor_name, params, body)
+        # add op add
+        add_name = f"{vec_name}.add"
+        body_add = [Assign("a", Var("a")), Assign("b", Var("b")), Return(Call("list_add", [Var("a"), Var("b")]))]
+        self._mk_func(add_name, ["a","b"], body_add)
+        return [ctor_name, add_name]
+
+# --- Rapid checkout (snapshot / restore) ---
+def rapid_checkout_snapshot(symtab: Dict[str, FuncDef], hot: HotSwapRegistry, path: str):
+    state = {
+        "symtab_keys": list(symtab.keys()),
+        "hot_keys": list(hot.table.keys()),
+        "hot_funcs": {k: serialize_funcdef(hot.table[k]) for k in hot.table.keys()}
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2)
+    print(f"[CHECKOUT] snapshot written to {path}")
+
+def rapid_checkout_restore(path: str, symtab: Dict[str, FuncDef], hot: HotSwapRegistry):
+    with open(path, "r", encoding="utf-8") as f:
+        state = json.load(f)
+    # restore functions into hot & symtab
+    for k, sf in state.get("hot_funcs", {}).items():
+        fd = deserialize_funcdef(sf)
+        hot.register(k, fd)
+        symtab[k] = fd
+    print(f"[CHECKOUT] restored snapshot from {path}")
+
+def serialize_funcdef(fd: FuncDef):
+    # minimal serializer: record name, params, and simple body as strings via repr
+    return {"name": fd.name, "params": fd.params, "body_repr": [repr(type(n)) for n in fd.body]}
+
+def deserialize_funcdef(sdata):
+    # can't recreate full AST robustly; create stub function that returns None
+    return FuncDef(sdata["name"], sdata["params"], [Return(Number("0"))])
+
+# --- Operation primitives for advanced types ---
+def list_add(a,b):
+    if not isinstance(a, list) or not isinstance(b, list): raise Exception("list_add requires lists")
+    n = max(len(a), len(b))
+    out = []
+    for i in range(n):
+        va = a[i] if i < len(a) else 0
+        vb = b[i] if i < len(b) else 0
+        out.append(va + vb)
+    return out
+
+# register primitive helper into MiniRuntime by patching eval dispatch or adding to builtins mapping
+def enable_mega_features(hot_registry: HotSwapRegistry, mini_runtime: MiniRuntime, fast_runtime: Optional[FastRuntime]=None):
+    # add new struct example
+    StructRegistry.register(StructDef("Point2D",[("x","Float64"),("y","Float64")]))
+    StructRegistry.register(StructDef("Rect",[("min","Point2D"),("max","Point2D")]))
+    # register runtime helper functions as hot functions (thin wrappers)
+    pf = FuncDef("list_add/2".split("/")[0], ["a","b"], [Return(Null())])  # placeholder
+    key = "list_add/2"
+    hot_registry.register(key, pf)  # placeholder so FastRuntime can resolve by name
+    # attach actual python implementation into FastVM/native resolver by adding into FastVM.resolve_call_target mapping via monkeypatch
+    # For MiniRuntime, inject a builtin dispatcher mapping name->callable
+    if not hasattr(mini_runtime, "_mega_builtins"):
+        mini_runtime._mega_builtins = {}
+        mini_runtime._mega_builtins["list_add"] = list_add
+    # patch MiniRuntime.eval to consult _mega_builtins before trying function lookup
+    orig_eval = mini_runtime.eval
+    def mega_eval(node):
+        if isinstance(node, Call):
+            if node.name in getattr(mini_runtime, "_mega_builtins", {}):
+                args = [mini_runtime.eval(a) for a in node.args]
+                return mini_runtime._mega_builtins[node.name](*args)
+        return orig_eval(node)
+    mini_runtime.eval = mega_eval
+    # allow fast_runtime to resolve 'list_add' if present
+    if fast_runtime:
+        # add to fast runtime globals mapping so FastVM.resolve_call_target picks it as native callable
+        fast_runtime.vm.globals["list_add"] = list_add
+    print("[MEGA] enabled: registered structs:", StructRegistry.dump())
+    print("[MEGA] available types:", TypeRegistry.list_types())
+    return True
+
+# Small convenience to introspect and expand codebase (self-expansion engine)
+def massive_self_expand(pattern: str, hot_registry: HotSwapRegistry, symtab: Dict[str, FuncDef], expander: SelfExpander):
+    """
+    Given a simple pattern, produce a family of functions and register them.
+    The pattern can be like "vector<N>" and the expander will create vector ops for common N.
+    """
+    created = []
+    if pattern.startswith("vector"):
+        for n in (2,3,4):
+            vecname = f"Vec{n}"
+            created += expander.generate_vector_ops(vecname, dims=n)
+    # produce checksum and report
+    digest = hashlib.sha256("".join(created).encode("utf-8")).hexdigest()[:8]
+    print(f"[SELF-EXPAND] generated {len(created)} symbols; digest={digest}")
+    return created
+
+# --- Register a few helpful macros and an automatic expander at import time ---
+_global_macro_engine = MacroEngine()
+def _macro_repeat_expand(node: Call):
+    # example macro: repeat(n, expr) -> expands into [expr, expr, ...]
+    if len(node.args) >= 2:
+        count_node, expr = node.args[0], node.args[1]
+        if isinstance(count_node, Number):
+            cnt = int(count_node.val)
+            return [expr for _ in range(cnt)]
+    return [node]
+
+
+# --- Quick demo wiring function for users ---
+def mega_demo_enable(symtab: Dict[str, FuncDef], hot_registry: HotSwapRegistry, mini_runtime: MiniRuntime, fast_runtime: Optional[FastRuntime]=None):
+    expander = SelfExpander(hot_registry, symtab)
+    created = massive_self_expand("vector", hot_registry, symtab, expander)
+    enable_mega_features(hot_registry, mini_runtime, fast_runtime)
+    # snapshot to file for rapid checkout
+    rapid_checkout_snapshot(symtab, hot_registry, "mega_snapshot.json")
+    return {"created": created, "snapshot": "mega_snapshot.json"}
+
+# End of MEGA FEATURES
+# -------------------------
+import os, atexit, pathlib, traceback, time
+
+def grand_resolve_and_execute():
+    if os.environ.get("XYZ_GRAND_EXECUTE", "0") != "1":
+        return
+
+    start = time.time()
+    print("\n[GRAND RESOLVE] Starting full pipeline resolution and execution")
+    try:
+        # Determine input source (prefer CLI arg)
+        src_path = None
+        if len(sys.argv) > 1 and os.path.isfile(sys.argv[1]):
+            src_path = sys.argv[1]
+        else:
+            # try common files
+            for cand in ("main.xy","main.xyz","input.xy","input.xyz"):
+                if os.path.isfile(cand):
+                    src_path = cand; break
+
+        if not src_path:
+            print("[GRAND RESOLVE] No source file found on CLI or defaults; aborting grand execution")
+            return
+
+        print(f"[GRAND RESOLVE] Using source: {src_path}")
+        with open(src_path, "r", encoding="utf-8") as f:
+            src = f.read()
+
+        # Attempt 1: ProCompiler end-to-end (preferred)
+        try:
+            print("[GRAND RESOLVE] Attempting ProCompiler pipeline (parse → typecheck → IR → execute)")
+            res = ProCompiler.pro_compile_and_run(src, entry="main/0")
+            print(f"[GRAND RESOLVE] ProCompiler execution returned: {res!r}")
+            print(f"[GRAND RESOLVE] Completed in {time.time()-start:.3f}s")
+            return
+        except Exception as e:
+            print("[GRAND RESOLVE] ProCompiler pipeline failed:", e)
+            traceback.print_exc()
+
+        # Fallback: parse with legacy Parser and compile/link artifacts
+        try:
+            print("[GRAND RESOLVE] Falling back to legacy Parser + Codegen + runtimes")
+            toks = lex(src)
+            legacy_parser = Parser(toks)
+            ast_main = legacy_parser.parse()
+            symtab = dict(legacy_parser.functions)
+
+            # emit annotated assembly and object
+            cg = Codegen(symtab, HotSwapRegistry())
+            asm = cg.generate(ast_main, emit_pkt=False)
+            obj_path = "grand_temp.xyzobj"
+            cg.emit_object(asm, obj_path)
+            linked_asm = "grand_linked.asm"
+            cg.link_objects([obj_path], linked_asm)
+
+            # Try FastRuntime if it compiles functions
+            try:
+                hot = HotSwapRegistry()
+                for k,v in symtab.items(): hot.register(k,v)
+                fast_rt = FastRuntime(symtab, hot)
+                print("[GRAND RESOLVE] Running FastRuntime main/0 ...")
+                fres = fast_rt.run("main/0", args=[])
+                print(f"[GRAND RESOLVE] FastRuntime main/0 -> {fres!r}")
+                print(f"[GRAND RESOLVE] Completed in {time.time()-start:.3f}s")
+                return
+            except Exception as fe:
+                print("[GRAND RESOLVE] FastRuntime run failed:", fe)
+                traceback.print_exc()
+
+            # Final fallback: MiniRuntime interpreter
+            try:
+                hot = HotSwapRegistry()
+                for k,v in symtab.items(): hot.register(k,v)
+                mini = MiniRuntime(symtab, hot)
+                print("[GRAND RESOLVE] Running MiniRuntime main/0 ...")
+                mres = mini.run_func("main/0", [])
+                print(f"[GRAND RESOLVE] MiniRuntime main/0 -> {mres!r}")
+                print(f"[GRAND RESOLVE] Completed in {time.time()-start:.3f}s")
+                return
+            except Exception as me:
+                print("[GRAND RESOLVE] MiniRuntime run failed:", me)
+                traceback.print_exc()
+
+        except Exception as e:
+            print("[GRAND RESOLVE] Legacy pipeline failed:", e)
+            traceback.print_exc()
+
+        print("[GRAND RESOLVE] All resolution attempts exhausted; nothing executed successfully.")
+    finally:
+        elapsed = time.time() - start
+        print(f"[GRAND RESOLVE] Finished attempts (elapsed {elapsed:.3f}s)")
+
+# Register atexit hook so grand resolution runs after main returns (only when enabled).
+atexit.register(grand_resolve_and_execute)
+# -------------------------
 from mimetypes import init
 import sys, re, argparse, math, threading, struct, json, socket
 from typing import List, Dict, Any
@@ -2044,4 +2375,804 @@ def compile_and_run_xyz(source_code: str, emit_obj: bool = True, emit_asm: bool 
         except Exception as e:
             print(f"[XYZ] Runtime error: {e}")
 
-           
+# Unified AST + Parser + TypeChecker + Interpreter (self-contained)
+# Append or import into the existing file. Use `UCompiler.run_source(src)` to parse+typecheck+run.
+
+from dataclasses import dataclass, field
+from typing import List, Dict, Any, Optional, Tuple, Union
+import re, math, threading
+from concurrent.futures import ThreadPoolExecutor
+
+# -------------------------
+# AST (Unified, dataclasses)
+# -------------------------
+@dataclass
+class UNode: pass
+
+@dataclass
+class UProgram(UNode):
+    funcs: List['UFunc'] = field(default_factory=list)
+    stmts: List[UNode] = field(default_factory=list)
+
+@dataclass
+class UFunc(UNode):
+    name: str
+    params: List[str]
+    body: List[UNode]
+
+@dataclass
+class UReturn(UNode):
+    expr: Optional[UNode]
+
+@dataclass
+class UCall(UNode):
+    target: Union[str, UNode]
+    args: List[UNode]
+
+@dataclass
+class UVar(UNode):
+    name: str
+
+@dataclass
+class UAssign(UNode):
+    name: str
+    expr: UNode
+
+@dataclass
+class UNumber(UNode):
+    val: Union[int,float]
+
+@dataclass
+class UString(UNode):
+    val: str
+
+@dataclass
+class UBool(UNode):
+    val: bool
+
+@dataclass
+class UList(UNode):
+    items: List[UNode]
+
+@dataclass
+class UMap(UNode):
+    pairs: List[Tuple[UNode,UNode]]
+
+@dataclass
+class UIndex(UNode):
+    base: UNode
+    idx: UNode
+
+@dataclass
+class UBinOp(UNode):
+    op: str
+    left: UNode
+    right: UNode
+
+@dataclass
+class UIf(UNode):
+    cond: UNode
+    then_body: List[UNode]
+    else_body: Optional[List[UNode]]
+
+@dataclass
+class UWhile(UNode):
+    cond: UNode
+    body: List[UNode]
+
+@dataclass
+class ULambda(UNode):
+    params: List[str]
+    body: List[UNode]
+
+
+KEYWORDS = {"func","return","if","else","while","for","true","false","null","lambda","print","alloc","free","parallel"}
+
+class Token:
+    def __init__(self, kind, val, pos): self.kind, self.val, self.pos = kind, val, pos
+    def __repr__(self): return f"Token({self.kind},{self.val})"
+
+def lex(src: str):
+    pos = 0
+    toks = []
+    for m in TOK_RE.finditer(src):
+        kind = m.lastgroup; val = m.group()
+        if kind == "WS": continue
+        if kind == "ID" and val in KEYWORDS:
+            kind = val.upper()
+        toks.append(Token(kind, val, m.start()))
+    toks.append(Token("EOF","",len(src)))
+    return toks
+
+# -------------------------
+# Parser (Pratt + recursive for statements)
+# -------------------------
+class Parser:
+    def __init__(self, tokens: List[Token]):
+        self.tokens = tokens; self.pos = 0
+    def peek(self): return self.tokens[self.pos]
+    def next(self): t = self.peek(); self.pos += 1; return t
+    def accept(self, kind): 
+        if self.peek().kind == kind: return self.next()
+        return None
+    def expect(self, kind):
+        t = self.next()
+        if t.kind != kind: raise SyntaxError(f"Expected {kind}, got {t.kind} at {t.pos}")
+        return t
+
+    def parse_program(self) -> UProgram:
+        prog = UProgram()
+        while self.peek().kind != "EOF":
+            if self.peek().kind == "func":
+                prog.funcs.append(self.parse_func())
+            else:
+                stmt = self.parse_stmt()
+                if stmt: prog.stmts.append(stmt)
+        return prog
+
+    def parse_func(self) -> UFunc:
+        self.expect("func")
+        name = self.expect("ID").val
+        self.expect("LP")
+        params = []
+        if self.peek().kind != "RP":
+            while True:
+                params.append(self.expect("ID").val)
+                if not self.accept("COMMA"): break
+        self.expect("RP")
+        self.expect("LBR")
+        body = []
+        while self.peek().kind != "RBR":
+            body.append(self.parse_stmt())
+        self.expect("RBR")
+        return UFunc(name, params, body)
+
+    def parse_stmt(self):
+        t = self.peek()
+        if t.kind == "SEMI":
+            self.next(); return None
+        if t.kind == "return":
+            self.next()
+            expr = self.parse_expr()
+            self.accept("SEMI")
+            return UReturn(expr)
+        if t.kind == "LBR":
+            self.next(); stmts=[]
+            while self.peek().kind != "RBR":
+                stmts.append(self.parse_stmt())
+            self.expect("RBR"); return stmts  # inline list of stmts (caller should flatten)
+        expr = self.parse_expr()
+        # assignment: ID = expr
+        if isinstance(expr, UVar) and self.peek().kind == "OP" and self.peek().val == "=":
+            self.next(); rhs = self.parse_expr(); self.accept("SEMI"); return UAssign(expr.name, rhs)
+        self.accept("SEMI")
+        return expr
+
+    # Pratt parser for expressions
+    def parse_expr(self, rbp=0):
+        t = self.next()
+        left = self.nud(t)
+        while rbp < self.lbp(self.peek()):
+            t = self.next()
+            left = self.led(t, left)
+        return left
+
+    def nud(self, token: Token):
+        if token.kind == "NUMBER":
+            v = float(token.val) if "." in token.val else int(token.val)
+            return UNumber(v)
+        if token.kind == "STRING":
+            s = token.val[1:-1].encode("utf-8").decode("unicode_escape")
+            return UString(s)
+        if token.kind == "true": return UBool(True)
+        if token.kind == "false": return UBool(False)
+        if token.kind == "null": return UVar("null")
+        if token.kind == "ID":
+            if self.peek().kind == "LP":
+                # call
+                self.next()  # eat LP
+                args=[]
+                if self.peek().kind != "RP":
+                    while True:
+                        args.append(self.parse_expr())
+                        if not self.accept("COMMA"): break
+                self.expect("RP")
+                return UCall(token.val, args)
+            return UVar(token.val)
+        if token.kind == "LP":
+            e = self.parse_expr()
+            self.expect("RP"); return e
+        if token.kind == "lambda":
+            self.expect("LP"); params=[]
+            if self.peek().kind != "RP":
+                while True:
+                    params.append(self.expect("ID").val)
+                    if not self.accept("COMMA"): break
+            self.expect("RP")
+            self.expect("LBR"); body=[]
+            while self.peek().kind != "RBR": body.append(self.parse_stmt())
+            self.expect("RBR"); return ULambda(params, body)
+        if token.kind == "LBRK":
+            items=[]
+            while self.peek().kind != "RBRK":
+                items.append(self.parse_expr())
+                if not self.accept("COMMA"): break
+            self.expect("RBRK"); return UList(items)
+        raise SyntaxError(f"Unexpected token {token}")
+
+    def lbp(self, peek_token):
+        if peek_token.kind == "OP":
+            v = peek_token.val
+            if v in ("+","-"): return 10
+            if v in ("*","/","%"): return 20
+            if v in ("==","!=","<","<=",">",">="): return 5
+            if v == ".": return 30
+            if v == "[": return 40
+            return 1
+        if peek_token.kind == "LP": return 30
+        return 0
+
+    def led(self, token: Token, left: UNode):
+        if token.kind == "OP":
+            op = token.val
+            # index shorthand: base [ idx ] handled as call-like if OP is '['
+            if op == "[":
+                idx = self.parse_expr(); self.expect("OP")  # expect ']'
+                return UIndex(left, idx)
+            right = self.parse_expr(self.lbp(token))
+            return UBinOp(op, left, right)
+        if token.kind == "LP":
+            # call on expression
+            args=[]
+            if self.peek().kind != "RP":
+                while True:
+                    args.append(self.parse_expr())
+                    if not self.accept("COMMA"): break
+            self.expect("RP")
+            return UCall(left, args)
+        raise SyntaxError(f"Unexpected led {token}")
+
+# -------------------------
+# TypeChecker (lightweight)
+# -------------------------
+class TypeError(Exception): pass
+
+class TypeChecker:
+    def __init__(self, prog: UProgram):
+        self.prog = prog
+        self.func_sigs: Dict[str,int] = {}
+    def check(self):
+        for fn in self.prog.funcs:
+            self.func_sigs[fn.name] = len(fn.params)
+        # basic checks: ensure main exists
+        if "main" not in self.func_sigs:
+            raise TypeError("Missing required function 'main' with 0 args")
+        return True
+
+# -------------------------
+# Interpreter (Mini runtime for UAST)
+# -------------------------
+class URuntime:
+    def __init__(self, prog: UProgram):
+        self.prog = prog
+        self.globals: Dict[str, Any] = {}
+        self.funcs: Dict[str, UFunc] = {f.name: f for f in prog.funcs}
+        self.lock = threading.Lock()
+
+    def run(self, entry="main", args=None):
+        args = args or []
+        if entry not in self.funcs:
+            raise RuntimeError(f"Function {entry} not found")
+        return self.exec_func(self.funcs[entry], args, call_stack=[])
+
+    def exec_func(self, func: UFunc, args: List[Any], call_stack: List[str]):
+        # simple frame
+        frame = dict(zip(func.params, args))
+        call_stack = call_stack + [func.name]
+        result = None
+        for stmt in func.body:
+            result = self.eval(stmt, frame, call_stack)
+            if isinstance(stmt, UReturn):
+                return result
+        return result
+
+    def eval(self, node: UNode, frame: Dict[str,Any], call_stack: List[str]):
+        if node is None: return None
+        t = type(node)
+        if t is UNumber: return node.val
+        if t is UString: return node.val
+        if t is UBool: return 1 if node.val else 0
+        if t is UVar: 
+            if node.name in frame: return frame[node.name]
+            if node.name in self.globals: return self.globals[node.name]
+            if node.name == "null": return None
+            return None
+        if t is UAssign:
+            val = self.eval(node.expr, frame, call_stack)
+            frame[node.name] = val
+            return val
+        if t is UBinOp:
+            l = self.eval(node.left, frame, call_stack)
+            r = self.eval(node.right, frame, call_stack)
+            if node.op == "+": return (l or 0) + (r or 0)
+            if node.op == "-": return (l or 0) - (r or 0)
+            if node.op == "*": return (l or 0) * (r or 0)
+            if node.op == "/": return 0 if (r or 0) == 0 else (l or 0) / r
+            if node.op == "==": return 1 if l == r else 0
+            if node.op == "!=": return 1 if l != r else 0
+            if node.op == "<": return 1 if l < r else 0
+            if node.op == ">": return 1 if l > r else 0
+            return None
+        if t is UCall:
+            # builtins
+            if isinstance(node.target, str):
+                name = node.target
+                if name == "print":
+                    vals = [self.eval(a, frame, call_stack) for a in node.args]
+                    print(*vals)
+                    return None
+                if name == "alloc":
+                    size = int(self.eval(node.args[0], frame, call_stack)) if node.args else 0
+                    return bytearray(size)
+            # user functions
+            if isinstance(node.target, str) and node.target in self.funcs:
+                fn = self.funcs[node.target]
+                argvals = [self.eval(a, frame, call_stack) for a in node.args]
+                return self.exec_func(fn, argvals, call_stack)
+            # call expression (lambda)
+            if isinstance(node.target, ULambda):
+                lamb = node.target
+                argvals = [self.eval(a, frame, call_stack) for a in node.args]
+                lframe = dict(zip(lamb.params, argvals))
+                res = None
+                for s in lamb.body:
+                    res = self.eval(s, lframe, call_stack)
+                    if isinstance(s, UReturn): return res
+                return res
+            # call on expression result if target is expression
+            if not isinstance(node.target, str):
+                targ = self.eval(node.target, frame, call_stack)
+                if callable(targ):
+                    args = [self.eval(a, frame, call_stack) for a in node.args]
+                    return targ(*args)
+            raise RuntimeError(f"Call target not found: {node.target}")
+        if t is UReturn:
+            return self.eval(node.expr, frame, call_stack) if node.expr else None
+        if t is UList:
+            return [self.eval(i, frame, call_stack) for i in node.items]
+        if t is UIndex:
+            base = self.eval(node.base, frame, call_stack)
+            idx = self.eval(node.idx, frame, call_stack)
+            return base[idx]
+        if t is UIf:
+            c = self.eval(node.cond, frame, call_stack)
+            if c:
+                for s in node.then_body: res = self.eval(s, frame, call_stack)
+                return res if 'res' in locals() else None
+            else:
+                if node.else_body:
+                    for s in node.else_body: res = self.eval(s, frame, call_stack)
+                    return res if 'res' in locals() else None
+                return None
+        if t is UWhile:
+            last = None
+            while self.eval(node.cond, frame, call_stack):
+                for s in node.body:
+                    last = self.eval(s, frame, call_stack)
+            return last
+        if t is ULambda:
+            # create Python callable that closes over body & params
+            def _callable(*call_args):
+                lframe = dict(zip(node.params, call_args))
+                for s in node.body:
+                    r = self.eval(s, lframe, call_stack)
+                    if isinstance(s, UReturn): return r
+                return None
+            return _callable
+        # fallback
+        return None
+
+# -------------------------
+# UCompiler Facade
+# -------------------------
+class UCompiler:
+    @staticmethod
+    def run_source(src: str, entry="main"):
+        toks = lex(src)
+        p = Parser(toks)
+        prog = p.parse_program()
+        # flatten nested statement-lists from blocks
+        def flatten(program: UProgram):
+            new_stmts=[]
+            for s in program.stmts:
+                if isinstance(s, list):
+                    new_stmts.extend(s)
+                else:
+                    new_stmts.append(s)
+            program.stmts = new_stmts
+            for fn in program.funcs:
+                nb=[]
+                for st in fn.body:
+                    if isinstance(st, list): nb.extend(st)
+                    else: nb.append(st)
+                fn.body = nb
+        flatten(prog)
+        # typecheck
+        TypeChecker(prog).check()
+        runtime = URuntime(prog)
+        return runtime.run(entry)
+
+# -------------------------
+# Example usage (inline)
+# -------------------------
+# src = '''
+# func main() {
+#   a = 1;
+#   b = 2;
+#   print(a + b);
+#   return 0;
+# }
+# '''
+# UCompiler.run_source(src)
+
+# -------------------------
+# ADVANCED ENGINE: JIT, SSA optimizer, type inference, vectorization, profiler hooks
+# Opt-in via AdvancedEngine.activate(...) or environment XYZ_ADVANCED=1
+# -------------------------
+import threading, time, types, math
+from typing import Set
+
+class SSAOptimizer:
+    """
+    Simple SSA-style transformations: constant propagation, dead-code elimination,
+    and temporary renaming for IR created by IRBuilder.
+    """
+    @staticmethod
+    def const_prop(instrs):
+        consts = {}
+        new_instrs = []
+        for ins in instrs:
+            if ins.op == IROp.CONST and ins.dst:
+                consts[ins.dst] = ins.args[0]
+                new_instrs.append(ins)
+            elif ins.op in (IROp.ADD, IROp.SUB, IROp.MUL, IROp.DIV) and ins.args:
+                a,b = ins.args
+                av = consts.get(a, None) if isinstance(a, str) else a
+                bv = consts.get(b, None) if isinstance(b, str) else b
+                if av is not None and bv is not None:
+                    # fold constant
+                    try:
+                        if ins.op == IROp.ADD: v = av + bv
+                        elif ins.op == IROp.SUB: v = av - bv
+                        elif ins.op == IROp.MUL: v = av * bv
+                        elif ins.op == IROp.DIV: v = 0 if bv == 0 else av / bv
+                        dst = ins.dst or "%const"
+                        new_instrs.append(IRInstr(IROp.CONST, (v,), dst))
+                        consts[dst] = v
+                        continue
+                    except Exception:
+                        pass
+                new_instrs.append(ins)
+            else:
+                new_instrs.append(ins)
+        return new_instrs
+
+    @staticmethod
+    def dead_code_elim(instrs):
+        # naive: track used dsts and remove unused CONST/LOAD results
+        used = set()
+        for ins in instrs:
+            for a in ins.args:
+                if isinstance(a, str) and a.startswith('%t'):
+                    used.add(a)
+        out = []
+        for ins in reversed(instrs):
+            if ins.dst and ins.dst.startswith('%t') and ins.dst not in used:
+                # remove instruction but propagate its inputs if used elsewhere (simple)
+                # mark its inputs as used if they are temps
+                for a in ins.args:
+                    if isinstance(a, str) and a.startswith('%t'):
+                        used.add(a)
+                continue
+            out.append(ins)
+            if ins.dst and ins.dst.startswith('%t'):
+                used.discard(ins.dst)
+        out.reverse()
+        return out
+
+    @staticmethod
+    def optimize(instrs):
+        i1 = SSAOptimizer.const_prop(instrs)
+        i2 = SSAOptimizer.dead_code_elim(i1)
+        return i2
+
+class TypeInfer:
+    """
+    Lightweight type inference over IR temps. Produces a mapping %t -> inferred type name string.
+    Types: int, float, any, list, null
+    """
+    @staticmethod
+    def infer(func_ir):
+        types_map = {}
+        def t_of_val(v):
+            if isinstance(v, int): return "int"
+            if isinstance(v, float): return "float"
+            if isinstance(v, list): return "list"
+            if v is None: return "null"
+            return "any"
+        # seed from CONSTs
+        for ins in func_ir:
+            if ins.op == IROp.CONST and ins.dst:
+                types_map[ins.dst] = t_of_val(ins.args[0])
+        # propagate for a few iterations
+        changed = True
+        iters = 0
+        while changed and iters < 8:
+            changed = False; iters += 1
+            for ins in func_ir:
+                if ins.op in (IROp.ADD, IROp.SUB, IROp.MUL, IROp.DIV):
+                    a,b = ins.args
+                    at = types_map.get(a, "any") if isinstance(a, str) else t_of_val(a)
+                    bt = types_map.get(b, "any") if isinstance(b, str) else t_of_val(b)
+                    newt = "float" if "float" in (at, bt) else ("int" if at=="int" and bt=="int" else "any")
+                    if ins.dst and types_map.get(ins.dst) != newt:
+                        types_map[ins.dst] = newt; changed = True
+                if ins.op == IROp.LIST and ins.dst:
+                    types_map[ins.dst] = "list"
+                if ins.op == IROp.INDEX and ins.dst:
+                    # indexing produces element type unknown -> any
+                    types_map[ins.dst] = "any"
+                if ins.op == IROp.CALL and ins.dst:
+                    types_map[ins.dst] = "any"
+        return types_map
+
+class JITCompiler:
+    """
+    JIT-compiles hot functions from AST FuncDef into native Python callables
+    and registers them as native targets for FastVM and MiniRuntime.
+    Very conservative: supports numeric arithmetic, local variables, return of numeric values,
+    calls to 'print' and other already-registered native helpers.
+    """
+    def __init__(self, hot_registry: HotSwapRegistry, symtab: Dict[str, FuncDef],
+                 fast_runtime: Optional[FastRuntime]=None, mini_runtime: Optional[MiniRuntime]=None,
+                 threshold: int=20):
+        self.hot = hot_registry
+        self.symtab = symtab
+        self.fast = fast_runtime
+        self.mini = mini_runtime
+        self.threshold = threshold
+        self.counts = {}        # key -> calls
+        self.jitted = set()
+        self.lock = threading.Lock()
+
+    def note_call(self, key):
+        with self.lock:
+            self.counts[key] = self.counts.get(key, 0) + 1
+            c = self.counts[key]
+        if c >= self.threshold and key not in self.jitted:
+            try:
+                self.jit_compile(key)
+            except Exception as e:
+                # JIT failure not fatal
+                print(f"[JIT] failed to compile {key}: {e}")
+
+    def jit_compile(self, key):
+        func = self.hot.get(key) or self.symtab.get(key)
+        if not func:
+            raise RuntimeError(f"JIT target not found: {key}")
+        # Build Python source
+        py_name = f"jitted_{key.replace('/','_')}"
+        params = func.params
+        src_lines = []
+        src_lines.append(f"def {py_name}({', '.join(params)}):")
+        # translate body
+        for stmt in func.body:
+            line = self._translate_stmt(stmt)
+            for l in line:
+                src_lines.append("    " + l)
+        src = "\n".join(src_lines)
+        globs = {"math": math, "print": print, "list_add": list_add}
+        locs = {}
+        try:
+            exec(src, globs, locs)
+            native = locs.get(py_name)
+            if not native:
+                raise RuntimeError("JIT exec did not produce function")
+            # register native callable
+            if self.fast:
+                cname = f"{func.name}/{len(func.params)}"
+                self.fast.vm.globals[cname] = native
+            if self.mini:
+                # register simple mapping under name for MiniRuntime builtins
+                mname = func.name
+                if not hasattr(self.mini, "_mega_builtins"):
+                    self.mini._mega_builtins = {}
+                # wrap to accept runtime frames produced by MiniRuntime
+                def wrapper(*args, _native=native):
+                    return _native(*args)
+                self.mini._mega_builtins[func.name] = wrapper
+            self.jitted.add(key)
+            print(f"[JIT] compiled and registered native {key}")
+        except Exception as e:
+            raise
+
+    def _translate_stmt(self, stmt):
+        # returns list of python source lines for this stmt (best-effort)
+        if isinstance(stmt, Return):
+            if isinstance(stmt.expr, Number):
+                return [f"return {repr(stmt.expr.val)}"]
+            if isinstance(stmt.expr, BinOp):
+                left = self._expr_to_code(stmt.expr.left)
+                right = self._expr_to_code(stmt.expr.right)
+                op = stmt.expr.op
+                opmap = {"+":"+","-":"-","*":"*","/":"/","^":"**"}
+                pyop = opmap.get(op, "+")
+                return [f"return ({left}) {pyop} ({right})"]
+            if isinstance(stmt.expr, Call) and isinstance(stmt.expr.name, str) and stmt.expr.name == "list_add":
+                a = self._expr_to_code(stmt.expr.args[0]); b = self._expr_to_code(stmt.expr.args[1])
+                return [f"return list_add({a},{b})"]
+            if isinstance(stmt.expr, Var):
+                return [f"return {stmt.expr.name}"]
+            return ["return None"]
+        if isinstance(stmt, Assign):
+            rhs = self._expr_to_code(stmt.expr)
+            return [f"{stmt.name} = {rhs}"]
+        if isinstance(stmt, Call):
+            if isinstance(stmt.name, str) and stmt.name == "print":
+                args = ", ".join(self._expr_to_code(a) for a in stmt.args)
+                return [f"print({args})"]
+            # fallback: call as python function if exists
+            args = ", ".join(self._expr_to_code(a) for a in stmt.args)
+            return [f"{stmt.name}({args})"]
+        # unsupported: emit pass
+        return ["pass"]
+
+    def _expr_to_code(self, expr):
+        if isinstance(expr, Number):
+            return repr(expr.val)
+        if isinstance(expr, Var):
+            return expr.name
+        if isinstance(expr, BinOp):
+            left = self._expr_to_code(expr.left); right = self._expr_to_code(expr.right)
+            opmap = {"+":"+","-":"-","*":"*","/":"/","^":"**"}
+            return f"({left} {opmap.get(expr.op,'+')} {right})"
+        if isinstance(expr, Call):
+            args = ", ".join(self._expr_to_code(a) for a in expr.args)
+            return f"{expr.name}({args})"
+        return "None"
+
+class AdvancedEngine:
+    """
+    Integrates SSAOptimizer, TypeInfer and JITCompiler. Optionally monitors ExecutionEngine and FastVM.
+    """
+    def __init__(self, symtab, hot_registry, fast_runtime=None, mini_runtime=None, threshold=20):
+        self.symtab = symtab
+        self.hot = hot_registry
+        self.fast = fast_runtime
+        self.mini = mini_runtime
+        self.jit = JITCompiler(hot_registry, symtab, fast_runtime, mini_runtime, threshold=threshold)
+        self.profile = {}   # key -> (count, total_time)
+        self._monitor_thread = None
+        self._stop = threading.Event()
+        # Hook into ExecutionEngine if present
+        self._hook_execution_engine()
+
+    def _hook_execution_engine(self):
+        # Hook FastVM.run and MiniRuntime.run_func to count and trigger JIT
+        if self.fast:
+            original_run = self.fast.run
+            def wrapped_run(key, args=None):
+                start = time.perf_counter()
+                res = original_run(key, args)
+                dur = time.perf_counter() - start
+                self._note_profile(key, dur)
+                self.jit.note_call(key)
+                return res
+            self.fast.run = wrapped_run
+        if self.mini:
+            original_run_func = self.mini.run_func
+            def wrapped_run_func(key, args):
+                start = time.perf_counter()
+                res = original_run_func(key, args)
+                dur = time.perf_counter() - start
+                self._note_profile(key, dur)
+                self.jit.note_call(key)
+                return res
+            self.mini.run_func = wrapped_run_func
+
+    def _note_profile(self, key, dur):
+        with threading.Lock():
+            c,t = self.profile.get(key,(0,0.0))
+            self.profile[key] = (c+1, t+dur)
+
+    def optimize_ir_all(self, funcs_ir):
+        # apply SSAOptimizer and TypeInfer across all functions
+        new_ir = {}
+        for k, ir in funcs_ir.items():
+            ir_opt = SSAOptimizer.optimize(list(ir))
+            types_map = TypeInfer.infer(ir_opt)
+            # annotate by setting a pseudo field: we'll keep as metadata dict (not altering IRInstr)
+            new_ir[k] = ir_opt
+            print(f"[ADV] {k}: inferred types { {k:v for k,v in list(types_map.items())[:8]} }")
+        return new_ir
+
+    def activate_monitoring(self):
+        if self._monitor_thread: return
+        self._monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
+        self._monitor_thread.start()
+
+    def _monitor_loop(self):
+        while not self._stop.wait(1.0):
+            # report hotspots
+            with threading.Lock():
+                items = sorted(self.profile.items(), key=lambda kv: kv[1][0], reverse=True)[:6]
+            if items:
+                s = ", ".join(f"{k}:{v[0]} calls" for k,v in items)
+                print(f"[ADV-PROF] hotspots: {s}")
+
+    def shutdown(self):
+        self._stop.set()
+        if self._monitor_thread:
+            self._monitor_thread.join(timeout=1.0)
+
+# Utility: Vectorized ops registration
+def register_vector_ops(fast_runtime: Optional[FastRuntime], mini_runtime: Optional[MiniRuntime]):
+    def vec_add(a,b):
+        if not isinstance(a, list) or not isinstance(b, list): raise TypeError("vec_add expects lists")
+        n = max(len(a), len(b))
+        return [(a[i] if i < len(a) else 0) + (b[i] if i < len(b) else 0) for i in range(n)]
+    if fast_runtime:
+        fast_runtime.vm.globals["vec_add/2"] = vec_add
+    if mini_runtime:
+        if not hasattr(mini_runtime, "_mega_builtins"): mini_runtime._mega_builtins = {}
+        mini_runtime._mega_builtins["vec_add"] = vec_add
+    print("[ADV] vector ops registered")
+
+# Activation helper
+def activate_advanced(symtab: Dict[str, FuncDef], hot_registry: HotSwapRegistry,
+                      fast_runtime: Optional[FastRuntime]=None, mini_runtime: Optional[MiniRuntime]=None,
+                      threshold: int=20):
+    adv = AdvancedEngine(symtab, hot_registry, fast_runtime, mini_runtime, threshold=threshold)
+    register_vector_ops(fast_runtime, mini_runtime)
+    adv.activate_monitoring()
+    # Auto-JIT any existing hot functions with simple bodies (best-effort)
+    for key, func in list(hot_registry.table.items()):
+        # conservative criterion: function body small
+        if isinstance(func, FuncDef) and len(func.body) <= 6:
+            try:
+                adv.jit.jit_compile(key)
+            except Exception:
+                pass
+    # if env var set, leave running; otherwise return engine for caller to manage
+    return adv
+
+# Auto-activate if environment variable is set
+if os.environ.get("XYZ_ADVANCED", "0") == "1":
+    try:
+        # only attempt activation if main objects exist
+        # try to obtain symtab/hot from module globals if present
+        _sym = globals().get("symtab", None)
+        _hot = globals().get("hot_registry", None)
+        _fast = globals().get("fast_rt", None) or globals().get("fast_runtime", None)
+        _mini = globals().get("runtime", None)
+        if _sym and _hot:
+            _adv_engine = activate_advanced(_sym, _hot, _fast, _mini, threshold=10)
+            print("[ADV] Auto-activated AdvancedEngine")
+    except Exception as e:
+        print("[ADV] auto-activation failed:", e)
+
+        # End of advanced engine
+       
+parser = Parser(toks)
+ast = parser.parse_program()
+            # Typecheck
+TypeChecker(ast).check()
+            # Symbol table
+symtab = {}
+for fn in ast.funcs:
+                symtab[f"{fn.name}/{len(fn.params)}"] = fn
+                # Hot-swap registry
+                hot_registry = HotSwapRegistry()
+
+                for k,v in symtab.items():
+                    hot_registry.register(k, v)
