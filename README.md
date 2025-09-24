@@ -109,3 +109,10 @@ Now -lxyzrt can be linked into programs emitted by your compiler.
 
 
 
+🔹 Build Instructions
+cd libxyzrt
+make              # builds libxyzrt.a and libxyzrt.so
+sudo make install # installs headers and libs into /usr/local
+
+
+
