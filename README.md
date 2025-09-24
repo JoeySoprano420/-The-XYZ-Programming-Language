@@ -193,3 +193,73 @@ run .cl file
 
 nvcc -arch=sm_75 -ptx force.cu -o force.ptx
 
+## currently
+
+
+---
+
+🧠 Architectural Highlights
+
+✅ Full Pipeline Execution
+
+• Lex → Parse → Typecheck → IR → Codegen → Runtime all in one flow.
+• Supports fallback tiers: `ProCompiler`, `FastRuntime`, `MiniRuntime`.
+
+
+✅ Hot-Swap & Mutation
+
+• `HotSwapRegistry` enables live function replacement.
+• `SelfExpander` can synthesize new functions and register them dynamically.
+
+
+✅ Macro & Type System
+
+• `MacroEngine` supports compile-time expansion.
+• `TypeRegistry` and `StructRegistry` allow rich type modeling, including vectors, matrices, and boxed structs.
+
+
+✅ Multi-Runtime Strategy
+
+• `MiniRuntime`: stack-frame emulation, closures, mutexes.
+• `FastRuntime`: bytecode VM with inline caching, memory pooling, and hot-path optimization.
+• `AdvancedEngine`: SSA optimizer, type inference, JIT hooks, profiler integration.
+
+
+---
+
+⚙️ Codegen & Linking
+
+• Emits annotated NASM x64 assembly.
+• Includes a dodecagram binary packer and object file emitter.
+• Can auto-link multiple object files and emit final assembly with syscall and FFI mapping.
+
+
+---
+
+🔁 Live System Features
+
+• Rapid Checkout: snapshot and restore of symbol tables and hot-swap states.
+• HotSwapServer: JSON-based IPC server for live mutation.
+• Macro Synthesis: vector ops, symbolic dispatch, and runtime fusion.
+
+
+---
+
+🧪 Advanced Capabilities
+
+• JITCompiler: compiles hot functions to native Python callables.
+• SSAOptimizer: constant folding, dead code elimination.
+• TypeInfer: symbolic type inference over IR.
+• FastVM: inline caching, parallel execution, fallback interpreter.
+
+
+---
+
+🧬 What This Enables
+
+• A symbolic runtime that can mutate, optimize, and dispatch behavior dynamically.
+• A compiler that feels like a living system—adaptive, introspective, and expressive.
+• A language that can rival C++ in performance while remaining lean and mutation-friendly.
+
+
+---
