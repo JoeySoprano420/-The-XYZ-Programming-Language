@@ -189,3 +189,7 @@ main() print ["Hello, world"] start
 
 ---
 
+run .cl file
+
+nvcc -arch=sm_75 -ptx force.cu -o force.ptx
+
