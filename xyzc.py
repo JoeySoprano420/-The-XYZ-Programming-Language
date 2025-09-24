@@ -1,1111 +1,857 @@
-# xyzc.py
-# XYZ Compiler (prototype v6)
-# Adds: typed functions, overloading by type, pragmas, lambdas, primitives,
-# recursion, parallelism, deltas, decimals, negatives, div-by-zero safe ops
-# Author: XYZ Project
+#!/usr/bin/env python3
+# xyzc.py - XYZ Compiler (Extended with auto-linker -> syscalls, persistent hot-swap IPC,
+# and extended interpreter with frames/closures)
+#
+# Features added:
+# - Auto-linker: map common extern calls (write/read/exit/getpid) to Linux syscalls and emit inline 'syscall'
+# - Persistent hot-swap API: small TCP JSON server on localhost:4000 supporting "swap" operations
+# - Interpreter: frame stack, parameter binding, Var lookup in frames, Lambda -> Closure objects, calling closures
+#
+# Usage:
+#  python xyz_practice.py input.xy --emit-asm --emit-pkt --hot-swap-server
+#  Then connect to localhost:4000 and send JSON to swap functions:
+#    {"op":"swap","key":"main/0","type":"const_return","value":123}
+#
 
-import re
-from typing import List
-import hashlib
-from typing import List
+import sys, re, argparse, math, threading, struct, json, socket, copy
+from typing import List, Dict
+from concurrent.futures import ThreadPoolExecutor
 
-# --------------------------
-# Token Types
-# --------------------------
-KEYWORDS = {
-    "main", "Start", "print", "return",
-    "if", "else", "while", "for", "parallel", "lambda",
-    "int", "float", "string", "bool",
-    "try", "catch", "throw", "except", "isolate", "delete",
-    "collect", "store", "flush", "sweep", "delta"
-}
-
-SYMBOLS = {
-    "{", "}", "[", "]", "(", ")", ";", "=", "+", "-", "*", "/", "%",
-    "<", ">", "==", ",", ":", "->"
-}
-
-PRAGMAS = {"#pragma"}
+# -------------------------
+# LEXER (extended)
+# -------------------------
+TOKENS = [
+    ("NUMBER", r"-?\d+(\.\d+)?"),
+    ("ID", r"[A-Za-z_][A-Za-z0-9_]*"),
+    ("STRING", r"\".*?\"|\'.*?\'"),
+    ("PRAGMA", r"#pragma\s+[A-Za-z0-9_ ]+"),
+    ("OP", r"[+\-*/=<>!&|%^.^]+"),
+    ("LPAREN", r"\("), ("RPAREN", r"\)"),
+    ("LBRACE", r"\{"), ("RBRACE", r"\}"),
+    ("SEMI", r";"), ("COMMA", r","),
+    ("KEYWORD", r"\b(func|return|if|else|while|for|lambda|true|false|null|parallel|enum|eval|poly|try|catch|throw|raise|force|extern|alloc|free|malloc|mutex|mutex_lock|mutex_unlock|Start|main|print)\b"),
+    ("WS", r"\s+"),
+]
 
 class Token:
-    def __init__(self, type_: str, value: str):
-        self.type = type_
-        self.value = value
+    def __init__(self, kind, val, pos): self.kind, self.val, self.pos = kind, val, pos
+    def __repr__(self): return f"<{self.kind}:{self.val}>"
 
-    def __repr__(self):
-        return f"<{self.type}:{self.value}>"
-
-# --------------------------
-# Lexer
-# --------------------------
-def tokenize(source: str) -> List[Token]:
-    tokens = []
-    i = 0
-    while i < len(source):
-        ch = source[i]
-
-        # Whitespace
-        if ch.isspace():
-            i += 1
-            continue
-
-        # Pragmas
-        if source.startswith("#pragma", i):
-            val = "#pragma"
-            tokens.append(Token("PRAGMA", val))
-            i += len(val)
-            continue
-
-        # Comments
-        if ch == ';':  # single line
-            while i < len(source) and source[i] != '\n':
-                i += 1
-            continue
-
-        # Multi-char symbols
-        if source.startswith("==", i):
-            tokens.append(Token("SYMBOL", "=="))
-            i += 2
-            continue
-        if source.startswith("->", i):
-            tokens.append(Token("SYMBOL", "->"))
-            i += 2
-            continue
-
-        # Symbols
-        if ch in SYMBOLS:
-            tokens.append(Token("SYMBOL", ch))
-            i += 1
-            continue
-
-        # Strings
-        if ch == '"' or ch in {'“','”'}:
-            i += 1
-            val = ""
-            while i < len(source) and source[i] not in {'"', '“', '”'}:
-                val += source[i]
-                i += 1
-            i += 1
-            tokens.append(Token("STRING", val))
-            continue
-
-        # Numbers (support decimals, negatives)
-        if ch.isdigit() or (ch == "-" and i+1 < len(source) and source[i+1].isdigit()):
-            val = ch
-            i += 1
-            dot_seen = (ch == ".")
-            while i < len(source) and (source[i].isdigit() or (source[i] == "." and not dot_seen)):
-                if source[i] == ".":
-                    dot_seen = True
-                val += source[i]
-                i += 1
-            tokens.append(Token("NUMBER", val))
-            continue
-
-        # Identifiers / keywords
-        if ch.isalpha():
-            val = ""
-            while i < len(source) and (source[i].isalnum() or source[i] in {"_", "-"}):
-                val += source[i]
-                i += 1
-            if val in KEYWORDS:
-                tokens.append(Token("KEYWORD", val))
-            else:
-                tokens.append(Token("IDENT", val))
-            continue
-
-        i += 1
+def lex(src: str):
+    pos, tokens = 0, []
+    while pos < len(src):
+        for kind, pat in TOKENS:
+            m = re.match(pat, src[pos:])
+            if m:
+                if kind != "WS":
+                    tokens.append(Token(kind, m.group(), pos))
+                pos += len(m.group()); break
+        else:
+            raise SyntaxError(f"Unexpected char {src[pos]} at {pos}")
     return tokens
 
-# --------------------------
-# AST
-# --------------------------
-class ASTNode:
-    def __init__(self, nodetype: str, value: str = "", children=None):
-        self.nodetype = nodetype
-        self.value = value
-        self.children = children or []
+# -------------------------
+# AST Nodes
+# -------------------------
+class ASTNode: pass
+class Program(ASTNode):
+    def __init__(self, body: List[ASTNode]): self.body = body
+class FuncDef(ASTNode):
+    def __init__(self, name, params, body): self.name, self.params, self.body = name, params, body
+class Call(ASTNode):
+    def __init__(self, name, args): self.name, self.args = name, args
+class Return(ASTNode):
+    def __init__(self, expr): self.expr = expr
+class Number(ASTNode):
+    def __init__(self, val):
+        self.raw = val
+        self.val = float(val) if "." in str(val) else int(val)
+        self.is_float = isinstance(self.val, float) and not float(self.val).is_integer()
+class Var(ASTNode):
+    def __init__(self, name): self.name = name
+class Assign(ASTNode):
+    def __init__(self, name, expr): self.name, self.expr = name, expr
+class BinOp(ASTNode):
+    def __init__(self, op, left, right): self.op, self.left, self.right = op, left, right
+class If(ASTNode):
+    def __init__(self, cond, then_body, else_body=None): self.cond, self.then_body, self.else_body = cond, then_body, else_body
+class While(ASTNode):
+    def __init__(self, cond, body): self.cond, self.body = cond, body
+class For(ASTNode):
+    def __init__(self, init, cond, step, body): self.init, self.cond, self.step, self.body = init, cond, step, body
+class Lambda(ASTNode):
+    def __init__(self, params, body): self.params, self.body = params, body
+class Bool(ASTNode):
+    def __init__(self, val): self.val = val
+class Null(ASTNode): pass
+class Pragma(ASTNode):
+    def __init__(self, directive): self.directive = directive
+class Enum(ASTNode):
+    def __init__(self, name, members): self.name, self.members = name, members
+class Eval(ASTNode):
+    def __init__(self, expr): self.expr = expr
+class Poly(ASTNode):
+    def __init__(self, expr): self.expr = expr
+class Parallel(ASTNode):
+    def __init__(self, body): self.body = body
+class TryCatch(ASTNode):
+    def __init__(self, try_body, catch_body): self.try_body, self.catch_body = try_body, catch_body
+class Throw(ASTNode):
+    def __init__(self, expr): self.expr = expr
 
-    def __repr__(self, level=0):
-        indent = "  " * level
-        res = f"{indent}{self.nodetype}({self.value})\n"
-        for child in self.children:
-            res += child.__repr__(level+1)
-        return res
-
-# --------------------------
-# Parser
-# --------------------------
+# -------------------------
+# PARSER with symbol table
+# -------------------------
 class Parser:
-    def __init__(self, tokens: List[Token]):
-        self.tokens = tokens
-        self.pos = 0
-        self.functions = {}  # { name: { (arity, types): ASTNode } }
+    def __init__(self, tokens):
+        self.tokens, self.pos = tokens, 0
+        self.functions: Dict[str, FuncDef] = {}  # symbol table: "name/arity" -> FuncDef
 
-    def peek(self):
-        return self.tokens[self.pos] if self.pos < len(self.tokens) else None
-
-    def advance(self):
+    def peek(self): return self.tokens[self.pos] if self.pos < len(self.tokens) else None
+    def eat(self, kind=None):
         tok = self.peek()
-        if tok: self.pos += 1
-        return tok
+        if not tok: raise SyntaxError("EOF")
+        if kind and tok.kind != kind: raise SyntaxError(f"Expected {kind}, got {tok.kind}")
+        self.pos += 1; return tok
 
-    def expect(self, value):
-        tok = self.advance()
-        if not tok or tok.value != value:
-            raise SyntaxError(f"Expected {value}, got {tok}")
-        return tok
+    def parse(self):
+        prog = Program(self.statements())
+        return prog
 
-    # ---- Program ----
-    def parse_program(self) -> ASTNode:
-        root = ASTNode("Program")
+    def statements(self):
+        stmts = []
         while self.peek():
-            stmt = self.parse_statement()
-            if stmt: root.children.append(stmt)
-        return root
-
-    def parse_statement(self) -> ASTNode:
-        tok = self.peek()
-        if not tok: return None
-
-        if tok.type == "PRAGMA":
-            return self.parse_pragma()
-        if tok.value in {"main","Start"} or (tok.type=="IDENT" and self.lookahead_is_func_def()):
-            return self.parse_function()
-        if tok.type == "KEYWORD" and tok.value == "return":
-            return self.parse_return()
-        if tok.value == "print":
-            return self.parse_print()
-        if tok.value == "if":
-            return self.parse_if()
-        if tok.value == "while":
-            return self.parse_while()
-        if tok.value == "for":
-            return self.parse_for()
-        if tok.value == "parallel":
-            return self.parse_parallel()
-        if tok.value == "lambda":
-            return self.parse_lambda()
-        if tok.type == "IDENT":
-            return self.parse_assignment_or_call()
-        return self.parse_expression()
-
-    def lookahead_is_func_def(self) -> bool:
-        # ident "(" paramlist ")"
-        return (self.pos+1 < len(self.tokens) and self.tokens[self.pos+1].value == "(")
-
-    # ---- Pragmas ----
-    def parse_pragma(self) -> ASTNode:
-        self.advance() # consume #pragma
-        name = self.advance().value
-        return ASTNode("Pragma", name)
-
-    # ---- Functions ----
-    def parse_function(self) -> ASTNode:
-        name = self.advance().value
-        self.expect("(")
-        params, types = [], []
-        while self.peek() and self.peek().value != ")":
-            p = self.advance().value  # param name
-            self.expect(":")
-            t = self.advance().value  # type
-            params.append(p)
-            types.append(t)
-            if self.peek() and self.peek().value == ",":
-                self.advance()
-        self.expect(")")
-        block = self.parse_block()
-        sig = (len(params), tuple(types))
-        func_node = ASTNode("Function", f"{name}/{sig}", [
-            ASTNode("Params", children=[ASTNode("Param", f"{p}:{t}") for p,t in zip(params,types)]),
-            block
-        ])
-        if name not in self.functions: self.functions[name] = {}
-        if sig in self.functions[name]:
-            raise SyntaxError(f"Function {name} with signature {sig} already defined")
-        self.functions[name][sig] = func_node
-        return func_node
-
-    # ---- Blocks ----
-    def parse_block(self) -> ASTNode:
-        tok = self.peek()
-        if tok and tok.value in {"{","["}:
-            close = "}" if tok.value == "{" else "]"
-            self.advance()
-            block = ASTNode("Block")
-            while self.peek() and self.peek().value != close:
-                block.children.append(self.parse_statement())
-            self.expect(close)
-            return block
-        else:
-            stmt = self.parse_statement()
-            return ASTNode("Block", children=[stmt])
-
-    # ---- Constructs ----
-    def parse_print(self): 
-        self.advance(); self.expect("["); expr=self.parse_expression(); self.expect("]")
-        return ASTNode("Print", children=[expr])
-
-    def parse_return(self): 
-        self.advance(); expr=self.parse_expression()
-        return ASTNode("Return", children=[expr])
-
-    def parse_if(self):
-        self.advance(); self.expect("("); cond=self.parse_expression(); self.expect(")")
-        thenb=self.parse_block(); elseb=None
-        if self.peek() and self.peek().value=="else":
-            self.advance(); elseb=self.parse_block()
-        return ASTNode("If", children=[cond,thenb]+([elseb] if elseb else []))
-
-    def parse_while(self):
-        self.advance(); self.expect("("); cond=self.parse_expression(); self.expect(")")
-        body=self.parse_block(); return ASTNode("While",children=[cond,body])
-
-    def parse_for(self):
-        self.advance(); self.expect("(")
-        init=self.parse_assignment_or_call(); cond=self.parse_expression()
-        self.expect(";"); step=self.parse_assignment_or_call(); self.expect(")")
-        body=self.parse_block()
-        return ASTNode("For",children=[init,cond,step,body])
-
-    def parse_parallel(self):
-        self.advance(); body=self.parse_block()
-        return ASTNode("Parallel",children=[body])
-
-    def parse_lambda(self):
-        self.advance(); self.expect("(")
-        params=[]; 
-        while self.peek() and self.peek().value!=")":
-            p=self.advance().value
-            if self.peek() and self.peek().value==":":
-                self.advance(); t=self.advance().value; p=f"{p}:{t}"
-            params.append(p)
-            if self.peek() and self.peek().value==",":
-                self.advance()
-        self.expect(")")
-        self.expect("->")
-        expr=self.parse_expression()
-        return ASTNode("Lambda",children=[ASTNode("Params",children=[ASTNode("Param",p) for p in params]),expr])
-
-    # ---- Assignment / Call ----
-    def parse_assignment_or_call(self):
-        ident=self.advance().value
-        if self.peek() and self.peek().value=="=":
-            self.advance(); expr=self.parse_expression()
-            return ASTNode("Assign",ident,[expr])
-        elif self.peek() and self.peek().value=="(":
-            self.expect("(")
-            args=[]
-            while self.peek() and self.peek().value!=")":
-                args.append(self.parse_expression())
-                if self.peek() and self.peek().value==",":
-                    self.advance()
-            self.expect(")")
-            sig=(len(args),"*") # simplified: type resolution could go here
-            return ASTNode("Call",f"{ident}/{sig}",args)
-        return ASTNode("Var",ident)
-
-    # ---- Expressions ----
-    def parse_expression(self):
-        node=self.parse_term()
-        while self.peek() and self.peek().value in {"+","-","==","<",">"}:
-            op=self.advance().value; right=self.parse_term()
-            node=ASTNode("BinaryOp",op,[node,right])
-        return node
-
-    def parse_term(self):
-        node=self.parse_factor()
-        while self.peek() and self.peek().value in {"*","/","%"}:
-            op=self.advance().value; right=self.parse_factor()
-            if op=="/":  # safe div node
-                node=ASTNode("SafeDiv",op,[node,right])
+            if self.peek().val == "func": stmts.append(self.funcdef())
+            elif self.peek().kind == "PRAGMA": stmts.append(Pragma(self.eat("PRAGMA").val))
             else:
-                node=ASTNode("BinaryOp",op,[node,right])
+                stmt = self.expression()
+                if stmt is not None: stmts.append(stmt)
+                else: self.pos += 1
+        return stmts
+
+    def funcdef(self):
+        self.eat("KEYWORD")  # func
+        name = self.eat("ID").val
+        self.eat("LPAREN")
+        params = []
+        while self.peek() and self.peek().kind != "RPAREN":
+            params.append(self.eat("ID").val)
+            if self.peek() and self.peek().kind == "COMMA": self.eat("COMMA")
+        self.eat("RPAREN")
+        self.eat("LBRACE")
+        body = []
+        while self.peek() and self.peek().kind != "RBRACE":
+            # support simple assignment with '=' as OP token
+            if self.peek().kind == "ID" and self.pos+1 < len(self.tokens) and self.tokens[self.pos+1].kind == "OP" and self.tokens[self.pos+1].val == "=":
+                name_tok = self.eat("ID").val
+                self.eat("OP")  # =
+                expr = self.expression()
+                body.append(Assign(name_tok, expr))
+            elif self.peek().val == "return":
+                self.eat("KEYWORD"); body.append(Return(self.expression()))
+            elif self.peek().val == "if":
+                body.append(self.ifstmt())
+            elif self.peek().val == "while":
+                body.append(self.whilestmt())
+            elif self.peek().val == "for":
+                body.append(self.forstmt())
+            elif self.peek().val == "parallel":
+                body.append(self.parallelblock())
+            elif self.peek().val == "try":
+                body.append(self.trycatch())
+            else:
+                expr = self.expression()
+                if expr is not None: body.append(expr)
+                else: self.pos += 1
+        self.eat("RBRACE")
+        func = FuncDef(name, params, body)
+        key = f"{name}/{len(params)}"
+        self.functions[key] = func  # register in symbol table
+        return func
+
+    # expression parsing
+    def expression(self): return self.parse_addsub()
+    def parse_addsub(self):
+        left = self.parse_muldiv()
+        while self.peek() and self.peek().kind == "OP" and self.peek().val in ("+","-","||"):
+            op = self.eat("OP").val
+            right = self.parse_muldiv()
+            left = BinOp(op, left, right)
+        return left
+    def parse_muldiv(self):
+        left = self.parse_pow()
+        while self.peek() and self.peek().kind == "OP" and self.peek().val in ("*","/","&&"):
+            op = self.eat("OP").val
+            right = self.parse_pow()
+            left = BinOp(op, left, right)
+        return left
+    def parse_pow(self):
+        left = self.parse_unary()
+        while self.peek() and self.peek().kind == "OP" and self.peek().val == "^":
+            op = self.eat("OP").val
+            right = self.parse_unary()
+            left = BinOp(op, left, right)
+        return left
+    def parse_unary(self):
+        tok = self.peek()
+        if not tok: return None
+        if tok.kind == "OP" and tok.val == "-":
+            self.eat("OP"); return BinOp("*", Number("-1"), self.parse_unary())
+        if tok.kind == "NUMBER": return Number(self.eat("NUMBER").val)
+        if tok.kind == "KEYWORD" and tok.val == "true": self.eat("KEYWORD"); return Bool(True)
+        if tok.kind == "KEYWORD" and tok.val == "false": self.eat("KEYWORD"); return Bool(False)
+        if tok.kind == "KEYWORD" and tok.val == "null": self.eat("KEYWORD"); return Null()
+        if tok.kind == "ID":
+            if self.pos+1 < len(self.tokens) and self.tokens[self.pos+1].kind == "LPAREN": return self.call()
+            return Var(self.eat("ID").val)
+        if tok.kind == "LPAREN":
+            self.eat("LPAREN"); e = self.expression(); self.eat("RPAREN"); return e
+        if tok.kind == "KEYWORD" and tok.val == "lambda": return self.lambdaexpr()
+        if tok.kind == "KEYWORD" and tok.val == "eval": return self.evalexpr()
+        if tok.kind == "KEYWORD" and tok.val == "enum": return self.enumdef()
+        return None
+    def call(self):
+        name = self.eat("ID").val; self.eat("LPAREN"); args = []
+        while self.peek() and self.peek().kind != "RPAREN":
+            args.append(self.expression())
+            if self.peek() and self.peek().kind == "COMMA": self.eat("COMMA")
+        self.eat("RPAREN"); return Call(name, args)
+    def lambdaexpr(self):
+        self.eat("KEYWORD"); self.eat("LPAREN"); params=[]
+        while self.peek() and self.peek().kind != "RPAREN":
+            params.append(self.eat("ID").val)
+            if self.peek() and self.peek().kind == "COMMA": self.eat("COMMA")
+        self.eat("RPAREN"); self.eat("LBRACE")
+        body = []
+        while self.peek() and self.peek().kind != "RBRACE":
+            if self.peek().val == "return":
+                self.eat("KEYWORD"); body.append(Return(self.expression()))
+            else:
+                body.append(self.expression())
+        self.eat("RBRACE"); return Lambda(params, body)
+    def evalexpr(self):
+        self.eat("KEYWORD"); self.eat("LPAREN"); s = self.eat("STRING").val; self.eat("RPAREN")
+        try:
+            value = eval(s.strip("\"'"), {"__builtins__": {}})
+        except Exception:
+            value = 0
+        return Eval(Number(str(value)))
+    def enumdef(self):
+        self.eat("KEYWORD"); name = self.eat("ID").val; self.eat("LBRACE")
+        members = {}; idx = 0
+        while self.peek() and self.peek().kind != "RBRACE":
+            key = self.eat("ID").val
+            if self.peek() and self.peek().kind == "OP" and self.peek().val == "=":
+                self.eat("OP"); val = int(self.eat("NUMBER").val); members[key] = val; idx = val + 1
+            else:
+                members[key] = idx; idx += 1
+            if self.peek() and self.peek().kind == "COMMA": self.eat("COMMA")
+        self.eat("RBRACE"); return Enum(name, members)
+    def ifstmt(self):
+        self.eat("KEYWORD"); self.eat("LPAREN"); cond = self.expression(); self.eat("RPAREN")
+        self.eat("LBRACE"); then_body = []
+        while self.peek() and self.peek().kind != "RBRACE": then_body.append(self.expression())
+        self.eat("RBRACE")
+        else_body = None
+        if self.peek() and self.peek().val == "else":
+            self.eat("KEYWORD"); self.eat("LBRACE"); else_body=[]
+            while self.peek() and self.peek().kind != "RBRACE": else_body.append(self.expression())
+            self.eat("RBRACE")
+        return If(cond, then_body, else_body)
+    def whilestmt(self):
+        self.eat("KEYWORD"); self.eat("LPAREN"); cond = self.expression(); self.eat("RPAREN")
+        self.eat("LBRACE"); body = []
+        while self.peek() and self.peek().kind != "RBRACE": body.append(self.expression())
+        self.eat("RBRACE"); return While(cond, body)
+    def forstmt(self):
+        self.eat("KEYWORD"); self.eat("LPAREN"); init = self.expression(); self.eat("SEMI")
+        cond = self.expression(); self.eat("SEMI"); step = self.expression()
+        self.eat("RPAREN"); self.eat("LBRACE"); body = []
+        while self.peek() and self.peek().kind != "RBRACE": body.append(self.expression())
+        self.eat("RBRACE"); return For(init, cond, step, body)
+    def parallelblock(self):
+        self.eat("KEYWORD"); self.eat("LBRACE"); body=[]
+        while self.peek() and self.peek().kind != "RBRACE": body.append(self.expression())
+        self.eat("RBRACE"); return Parallel(body)
+    def trycatch(self):
+        self.eat("KEYWORD"); self.eat("LBRACE"); try_body=[]
+        while self.peek() and self.peek().kind != "RBRACE": try_body.append(self.expression())
+        self.eat("RBRACE"); self.eat("KEYWORD"); self.eat("LBRACE"); catch_body=[]
+        while self.peek() and self.peek().kind != "RBRACE": catch_body.append(self.expression())
+        self.eat("RBRACE"); return TryCatch(try_body, catch_body)
+
+# -------------------------
+# Hot-Swap Registry
+# -------------------------
+class HotSwapRegistry:
+    def __init__(self):
+        # map symbol key -> FuncDef
+        self.table: Dict[str, FuncDef] = {}
+        self.lock = threading.Lock()
+
+    def register(self, key: str, func: FuncDef):
+        with self.lock:
+            self.table[key] = func
+
+    def get(self, key: str):
+        with self.lock:
+            return self.table.get(key)
+
+    def swap(self, key: str, new_func: FuncDef):
+        with self.lock:
+            old = self.table.get(key)
+            self.table[key] = new_func
+        print(f"[HOTSWAP] {key}: {'replaced' if old else 'registered'}")
+        return old
+
+# -------------------------
+# Optimizer (same)
+# -------------------------
+def optimize(node):
+    if isinstance(node, Program):
+        node.body = [optimize(s) for s in node.body]
         return node
-
-    def parse_factor(self):
-        tok=self.advance()
-        if tok.type=="NUMBER": return ASTNode("Number",tok.value)
-        if tok.type=="STRING": return ASTNode("String",tok.value)
-        if tok.type=="IDENT":
-            if self.peek() and self.peek().value=="(":
-                self.expect("("); args=[]
-                while self.peek() and self.peek().value!=")":
-                    args.append(self.parse_expression())
-                    if self.peek() and self.peek().value==",":
-                        self.advance()
-                self.expect(")")
-                return ASTNode("Call",f"{tok.value}/{len(args)}",args)
-            return ASTNode("Var",tok.value)
-        if tok.value=="(":
-            expr=self.parse_expression(); self.expect(")"); return expr
-        if tok.value=="-": # negative numbers
-            val=self.parse_factor(); return ASTNode("Neg",children=[val])
-        if tok.value=="delta": # delta operator
-            var=self.advance().value; expr=self.parse_expression()
-            return ASTNode("Delta",var,[expr])
-        raise SyntaxError(f"Unexpected token {tok}")
-
-# --------------------------
-# Dodecagram Encoder (0–9,a,b)
-# --------------------------
-def encode_dodecagram(n:int)->str:
-    symbols="0123456789ab"
-    if n==0:return "0"
-    out=""
-    while n>0: out=symbols[n%12]+out; n//=12
-    return out
-
-def build_dodecagram_ast(ast:ASTNode,counter=[0])->dict:
-    node_id=encode_dodecagram(counter[0]); counter[0]+=1
-    return {
-        "id":node_id,
-        "type":ast.nodetype,
-        "value":ast.value,
-        "children":[build_dodecagram_ast(c,counter) for c in ast.children]
-    }
-
-# --------------------------
-# Demo
-# --------------------------
-if __name__=="__main__":
-    code="""
-    #pragma parallel
-
-    Factorial(n:int) {
-        if(n == 0) { return 1 }
-        else { return n * Factorial(n - 1) }
-    }
-
-    Add(x:int, y:int) { return x + y }
-    Add(x:string, y:string) { return x + y }
-
-    main() {
-        a = Factorial(5)
-        b = Add(3,4)
-        c = Add("Hi, ","there")
-        f = lambda(x:int,y:int) -> x + y
-        print [a]
-        print [b]
-        print [c]
-        print [f(10,20)]
-        parallel { print ["running in parallel"] }
-        delta dx x - 1
-        z = -3.14 / 0  ; safe div by zero
-    }
-    """
-    toks=tokenize(code)
-    print("TOKENS:",toks)
-
-    parser=Parser(toks)
-    ast=parser.parse_program()
-    print("\nAST:\n",ast)
-
-    dag=build_dodecagram_ast(ast)
-    print("\nDODECAGRAM AST:",dag)
-
-# --------------------------
-# Token Types
-# --------------------------
-KEYWORDS = {
-    "main", "Start", "print", "return", "if", "else",
-    "while", "for", "do", "loop", "switch", "case",
-    "parallel", "lambda", "enum", "eval", "poly", "derivative",
-    "true", "false", "null",
-    "int", "float", "string", "bool", "nulltype"
-}
-
-SYMBOLS = {
-    "{", "}", "[", "]", "(", ")", ";", "=", "+", "-", "*", "/", "%",
-    "<", ">", "==", ",", ":", "->", "^"
-}
-
-PRAGMAS = {"#pragma"}
-
-class Token:
-    def __init__(self, type_: str, value: str):
-        self.type = type_
-        self.value = value
-    def __repr__(self):
-        return f"<{self.type}:{self.value}>"
-
-# --------------------------
-# AST
-# --------------------------
-class ASTNode:
-    def __init__(self, nodetype: str, value: str = "", children=None):
-        self.nodetype = nodetype
-        self.value = value
-        self.children = children or []
-    def __repr__(self, level=0):
-        indent = "  " * level
-        res = f"{indent}{self.nodetype}({self.value})\n"
-        for child in self.children:
-            res += child.__repr__(level+1)
-        return res
-
-# --------------------------
-# Lexer
-# --------------------------
-def tokenize(src: str) -> List[Token]:
-    i, tokens = 0, []
-    while i < len(src):
-        ch = src[i]
-
-        if src.startswith("#pragma", i):
-            tokens.append(Token("PRAGMA", "#pragma"))
-            i += 7; continue
-
-        if ch.isspace():
-            i += 1; continue
-
-        if src.startswith("==", i):
-            tokens.append(Token("SYMBOL","==")); i+=2; continue
-        if src.startswith("->", i):
-            tokens.append(Token("SYMBOL","->")); i+=2; continue
-
-        if ch in SYMBOLS:
-            tokens.append(Token("SYMBOL",ch)); i+=1; continue
-
-        if ch=='"':
-            i+=1; val=""
-            while i<len(src) and src[i]!='"':
-                val+=src[i]; i+=1
-            i+=1; tokens.append(Token("STRING",val)); continue
-
-        if ch.isdigit() or (ch=="-" and i+1<len(src) and src[i+1].isdigit()):
-            val=ch; i+=1
-            while i<len(src) and (src[i].isdigit() or src[i]=="."):
-                val+=src[i]; i+=1
-            tokens.append(Token("NUMBER",val)); continue
-
-        if ch.isalpha():
-            val=""
-            while i<len(src) and (src[i].isalnum() or src[i]=="_"):
-                val+=src[i]; i+=1
-            if val in KEYWORDS: tokens.append(Token("KEYWORD",val))
-            else: tokens.append(Token("IDENT",val))
-            continue
-
-        i+=1
-    return tokens
-
-# --------------------------
-# Type Checker
-# --------------------------
-class TypeEnv:
-    def __init__(self):
-        self.symbols={}  # var → type
-    def set(self,name,typ): self.symbols[name]=typ
-    def get(self,name): return self.symbols.get(name,"unknown")
-
-def type_check(node:ASTNode, env:TypeEnv):
-    if node.nodetype=="Number":
-        return "float" if "." in node.value else "int"
-    if node.nodetype=="String": return "string"
-    if node.nodetype=="Bool": return "bool"
-    if node.nodetype=="Null": return "nulltype"
-    if node.nodetype=="Var":
-        return env.get(node.value)
-    if node.nodetype=="Assign":
-        typ=type_check(node.children[0],env)
-        env.set(node.value,typ); return typ
-    if node.nodetype=="BinaryOp":
-        lt=type_check(node.children[0],env)
-        rt=type_check(node.children[1],env)
-        if lt!=rt: raise TypeError(f"Type mismatch {lt} vs {rt}")
-        return lt
-    if node.nodetype=="Call":
-        return "int" # simplified placeholder
-    if node.nodetype=="Derivative": return "poly"
-    if node.nodetype=="Eval": return "int"
-    return "unknown"
-
-# --------------------------
-# Parser (partial demo subset)
-# --------------------------
-class Parser:
-    def __init__(self,tokens:List[Token]):
-        self.tokens=tokens; self.pos=0
-    def peek(self): return self.tokens[self.pos] if self.pos<len(self.tokens) else None
-    def advance(self): tok=self.peek(); self.pos+=1; return tok
-    def expect(self,v): tok=self.advance(); 
-        # skipping real check for brevity
-        return tok
-
-    def parse_program(self)->ASTNode:
-        root=ASTNode("Program")
-        while self.peek(): root.children.append(self.parse_statement())
-        return root
-
-    def parse_statement(self)->ASTNode:
-        tok=self.peek()
-        if not tok: return None
-        if tok.value=="enum": return self.parse_enum()
-        if tok.value=="eval": return self.parse_eval()
-        if tok.value=="derivative": return self.parse_derivative()
-        if tok.value in {"true","false"}: self.advance(); return ASTNode("Bool",tok.value)
-        if tok.value=="null": self.advance(); return ASTNode("Null","null")
-        if tok.type=="NUMBER": self.advance(); return ASTNode("Number",tok.value)
-        if tok.type=="STRING": self.advance(); return ASTNode("String",tok.value)
-        if tok.type=="IDENT": return self.parse_assignment()
-        self.advance(); return ASTNode("Unknown",tok.value)
-
-    def parse_enum(self)->ASTNode:
-        self.advance() # enum
-        name=self.advance().value
-        self.expect("{")
-        values=[]
-        while self.peek() and self.peek().value!="}":
-            v=self.advance().value
-            if v!="}": values.append(ASTNode("EnumVal",v))
-            if self.peek() and self.peek().value==",": self.advance()
-        self.expect("}")
-        return ASTNode("Enum",name,values)
-
-    def parse_eval(self)->ASTNode:
-        self.advance(); self.expect("(")
-        expr=self.advance().value
-        self.expect(")")
-        return ASTNode("Eval",expr)
-
-    def parse_derivative(self)->ASTNode:
-        self.advance(); self.expect("(")
-        var=self.advance().value
-        expr=self.advance().value
-        self.expect(")")
-        return ASTNode("Derivative",var,[ASTNode("Expr",expr)])
-
-    def parse_assignment(self)->ASTNode:
-        name=self.advance().value
-        if self.peek() and self.peek().value=="=":
-            self.advance()
-            expr=self.advance().value
-            return ASTNode("Assign",name,[ASTNode("Var",expr)])
-        return ASTNode("Var",name)
-
-# --------------------------
-# Demo
-# --------------------------
-if __name__=="__main__":
-    code="""
-    enum Colors { Red, Green, Blue }
-    x = Colors
-    eval("3+4")
-    derivative(x x^2+3x)
-    y = true
-    z = null
-    """
-    toks=tokenize(code)
-    print("TOKENS:",toks)
-
-    parser=Parser(toks)
-    ast=parser.parse_program()
-    print("\nAST:\n",ast)
-
-    env=TypeEnv()
-    for child in ast.children:
-        try: print(f"{child.nodetype} -> {type_check(child,env)}")
-        except Exception as e: print(f"Type error: {e}")
-
-# xyzc.py
-# XYZ Compiler (prototype v8)
-# Adds: switch/case, do/while, loop, polynomial expressions,
-# obfuscation + polymorphism engines
-# Author: XYZ Project
-
-import hashlib
-from typing import List
-
-# --------------------------
-# Token + Lexer
-# --------------------------
-KEYWORDS = {
-    "main","Start","print","return",
-    "if","else","while","for","do","loop",
-    "switch","case","default","break",
-    "parallel","lambda","enum","eval","poly","derivative",
-    "true","false","null",
-    "int","float","string","bool","nulltype"
-}
-
-SYMBOLS = {
-    "{","}","[","]","(",")",";","=", "+","-","*","/","%","<",">","==",",",":","->","^"
-}
-
-PRAGMAS = {"#pragma"}
-
-class Token:
-    def __init__(self,type_:str,value:str):
-        self.type=type_; self.value=value
-    def __repr__(self): return f"<{self.type}:{self.value}>"
-
-def tokenize(src:str)->List[Token]:
-    i,toks=0,[]
-    while i<len(src):
-        ch=src[i]
-        if src.startswith("#pragma",i):
-            toks.append(Token("PRAGMA","#pragma")); i+=7; continue
-        if ch.isspace(): i+=1; continue
-        if src.startswith("==",i): toks.append(Token("SYMBOL","==")); i+=2; continue
-        if src.startswith("->",i): toks.append(Token("SYMBOL","->")); i+=2; continue
-        if ch in SYMBOLS: toks.append(Token("SYMBOL",ch)); i+=1; continue
-        if ch=='"': i+=1; val=""
-        # string
-            while i<len(src) and src[i]!='"':
-                val+=src[i]; i+=1
-            i+=1; toks.append(Token("STRING",val)); continue
-        if ch.isdigit() or (ch=="-" and i+1<len(src) and src[i+1].isdigit()):
-            val=ch; i+=1
-            while i<len(src) and (src[i].isdigit() or src[i]=="."):
-                val+=src[i]; i+=1
-            toks.append(Token("NUMBER",val)); continue
-        if ch.isalpha():
-            val=""
-            while i<len(src) and (src[i].isalnum() or src[i]=="_"):
-                val+=src[i]; i+=1
-            if val in KEYWORDS: toks.append(Token("KEYWORD",val))
-            else: toks.append(Token("IDENT",val))
-            continue
-        i+=1
-    return toks
-
-# --------------------------
-# AST
-# --------------------------
-class ASTNode:
-    def __init__(self,nodetype:str,value:str="",children=None):
-        self.nodetype=nodetype; self.value=value; self.children=children or []
-    def __repr__(self,level=0):
-        ind="  "*level; s=f"{ind}{self.nodetype}({self.value})\n"
-        for c in self.children: s+=c.__repr__(level+1)
-        return s
-
-# --------------------------
-# Parser
-# --------------------------
-class Parser:
-    def __init__(self,toks:List[Token]):
-        self.toks=toks; self.pos=0
-    def peek(self): return self.toks[self.pos] if self.pos<len(self.toks) else None
-    def advance(self): t=self.peek(); self.pos+=1; return t
-    def expect(self,v): t=self.advance(); 
-        if not t or t.value!=v: raise SyntaxError(f"Expected {v}, got {t}")
-        return t
-
-    def parse_program(self)->ASTNode:
-        root=ASTNode("Program")
-        while self.peek(): root.children.append(self.parse_statement())
-        return root
-
-    def parse_statement(self)->ASTNode:
-        tok=self.peek()
-        if not tok: return None
-        if tok.type=="PRAGMA": return self.parse_pragma()
-        if tok.value=="switch": return self.parse_switch()
-        if tok.value=="do": return self.parse_do_while()
-        if tok.value=="loop": return self.parse_loop()
-        if tok.value=="poly": return self.parse_polynomial()
-        if tok.type=="NUMBER": self.advance(); return ASTNode("Number",tok.value)
-        if tok.type=="STRING": self.advance(); return ASTNode("String",tok.value)
-        if tok.value in {"true","false"}: self.advance(); return ASTNode("Bool",tok.value)
-        if tok.value=="null": self.advance(); return ASTNode("Null","null")
-        self.advance(); return ASTNode("Unknown",tok.value)
-
-    # --- Pragmas ---
-    def parse_pragma(self)->ASTNode:
-        self.advance()
-        name=self.advance().value
-        return ASTNode("Pragma",name)
-
-    # --- Switch/Case ---
-    def parse_switch(self)->ASTNode:
-        self.advance(); self.expect("(")
-        expr=self.advance().value
-        self.expect(")")
-        self.expect("{")
-        cases=[]
-        while self.peek() and self.peek().value!="}":
-            if self.peek().value=="case":
-                self.advance(); val=self.advance().value; self.expect(":")
-                cases.append(ASTNode("Case",val,[ASTNode("Stmt","...")]))
-            elif self.peek().value=="default":
-                self.advance(); self.expect(":")
-                cases.append(ASTNode("Default","",[ASTNode("Stmt","...")]))
-            else: self.advance()
-        self.expect("}")
-        return ASTNode("Switch",expr,cases)
-
-    # --- Do/While ---
-    def parse_do_while(self)->ASTNode:
-        self.advance()
-        body=self.parse_block()
-        self.expect("while"); self.expect("(")
-        cond=self.advance().value; self.expect(")")
-        return ASTNode("DoWhile","",[body,ASTNode("Cond",cond)])
-
-    def parse_block(self)->ASTNode:
-        self.expect("{"); block=ASTNode("Block")
-        while self.peek() and self.peek().value!="}":
-            block.children.append(ASTNode("Stmt",self.advance().value))
-        self.expect("}"); return block
-
-    # --- Loop infinite ---
-    def parse_loop(self)->ASTNode:
-        self.advance()
-        body=self.parse_block()
-        return ASTNode("Loop","",[body])
-
-    # --- Polynomial ---
-    def parse_polynomial(self)->ASTNode:
-        self.advance(); self.expect("(")
-        expr=""
-        while self.peek() and self.peek().value!=")":
-            expr+=self.advance().value
-        self.expect(")")
-        return ASTNode("Polynomial",expr)
-
-# --------------------------
-# Obfuscation Engine
-# --------------------------
-def obfuscate_ast(ast:ASTNode,active=False):
-    if ast.nodetype=="Pragma" and ast.value=="obfuscate":
-        active=True
-    if active and ast.nodetype in {"Var","Function","Assign"}:
-        h=hashlib.sha1(ast.value.encode()).hexdigest()[:8]
-        ast.value=f"obf_{h}"
-    for c in ast.children:
-        obfuscate_ast(c,active)
-
-# --------------------------
-# Polymorphism Engine
-# --------------------------
-def generalize_functions(ast:ASTNode):
-    # Very simple demo: marks overloaded functions as "polymorphic"
-    funcs=[c for c in ast.children if c.nodetype=="Function"]
-    names={}
-    for f in funcs:
-        base=f.value.split("/")[0]
-        names.setdefault(base,[]).append(f)
-    for n,flist in names.items():
-        if len(flist)>1:
-            for f in flist: f.nodetype="PolyFunction"
-
-# --------------------------
-# Demo
-# --------------------------
-if __name__=="__main__":
-    code="""
-    #pragma obfuscate
-
-    switch(x) {
-        case 1: break;
-        case 2: break;
-        default: break;
-    }
-
-    do { print["hi"] } while(x < 10)
-
-    loop { print["forever"] }
-
-    poly(x^2 + 3x + 2)
-    """
-    toks=tokenize(code)
-    print("TOKENS:",toks)
-
-    parser=Parser(toks)
-    ast=parser.parse_program()
-    print("\nAST before obfuscation:\n",ast)
-
-    obfuscate_ast(ast)
-    generalize_functions(ast)
-
-    print("\nAST after obfuscation + polymorphism:\n",ast)
-
-# xyzc.py
-# XYZ Compiler v9
-# Adds: type inference, enum typing, polynomial typing
-# NASM x86-64 codegen from AST
-# Author: XYZ Project
-
-import hashlib
-from typing import List
-
-# --------------------------
-# AST
-# --------------------------
-class ASTNode:
-    def __init__(self,nodetype:str,value:str="",children=None):
-        self.nodetype=nodetype; self.value=value; self.children=children or []
-    def __repr__(self,level=0):
-        ind="  "*level; s=f"{ind}{self.nodetype}({self.value})\n"
-        for c in self.children: s+=c.__repr__(level+1)
-        return s
-
-# --------------------------
-# Type System
-# --------------------------
-class TypeEnv:
-    def __init__(self):
-        self.vars={}   # var -> type
-        self.enums={}  # enum -> values
-        self.funcs={}  # func -> return type
-    def set_var(self,name,typ): self.vars[name]=typ
-    def get_var(self,name): return self.vars.get(name,"unknown")
-    def add_enum(self,name,vals): self.enums[name]=vals
-    def get_enum(self,name): return self.enums.get(name,[])
-    def set_func(self,name,ret): self.funcs[name]=ret
-    def get_func(self,name): return self.funcs.get(name,"unknown")
-
-def infer_type(node:ASTNode,env:TypeEnv):
-    if node.nodetype=="Number":
-        return "float" if "." in node.value else "int"
-    if node.nodetype=="String": return "string"
-    if node.nodetype=="Bool": return "bool"
-    if node.nodetype=="Null": return "nulltype"
-    if node.nodetype=="EnumVal":
-        return node.value.split(".")[0]  # Colors.Red -> Colors
-    if node.nodetype=="Polynomial": return "poly"
-    if node.nodetype=="Assign":
-        t=infer_type(node.children[0],env); env.set_var(node.value,t); return t
-    if node.nodetype=="Var": return env.get_var(node.value)
-    if node.nodetype=="BinaryOp":
-        lt=infer_type(node.children[0],env); rt=infer_type(node.children[1],env)
-        if lt!=rt: raise TypeError(f"Type mismatch: {lt} vs {rt}")
-        return lt
-    if node.nodetype=="If": return infer_type(node.children[1],env)
-    if node.nodetype=="Call": return env.get_func(node.value,"int")
-    return "unknown"
-
-# --------------------------
-# NASM Codegen
-# --------------------------
+    if isinstance(node, FuncDef):
+        node.body = [optimize(s) for s in node.body]
+        return node
+    if isinstance(node, Return):
+        node.expr = optimize(node.expr)
+        return node
+    if isinstance(node, BinOp):
+        node.left = optimize(node.left); node.right = optimize(node.right)
+        if isinstance(node.left, Number) and isinstance(node.right, Number):
+            try:
+                if node.op == "+": return Number(str(node.left.val + node.right.val))
+                if node.op == "-": return Number(str(node.left.val - node.right.val))
+                if node.op == "*": return Number(str(node.left.val * node.right.val))
+                if node.op == "/":
+                    if node.right.val == 0:
+                        return Number("0")
+                    return Number(str(node.left.val / node.right.val))
+                if node.op == "^": return Number(str(int(math.pow(node.left.val, node.right.val))))
+            except Exception:
+                return node
+        return node
+    if isinstance(node, If):
+        node.cond = optimize(node.cond)
+        node.then_body = [optimize(s) for s in node.then_body]
+        node.else_body = [optimize(s) for s in (node.else_body or [])]
+        if isinstance(node.cond, Bool):
+            return Program(node.then_body if node.cond.val else node.else_body)
+        return node
+    if isinstance(node, Parallel):
+        node.body = [optimize(s) for s in node.body]
+        return node
+    return node
+
+# -------------------------
+# CODEGEN + auto-linker to syscalls
+# - If calls map to syscall_map and not user function, emit inline syscall sequence (no wrapper)
+# -------------------------
 class Codegen:
-    def __init__(self):
-        self.asm=[]
-        self.label_counter=0
-    def emit(self,line): self.asm.append(line)
-    def new_label(self,base="L"): 
-        self.label_counter+=1; return f"{base}{self.label_counter}"
-    def gen(self,node:ASTNode):
-        m=node.nodetype
-        if m=="Number":
-            self.emit(f"    mov rax,{node.value}")
-        elif m=="BinaryOp":
-            self.gen(node.children[0]); self.emit("    push rax")
-            self.gen(node.children[1]); self.emit("    mov rbx,rax")
-            self.emit("    pop rax")
-            if node.value=="+": self.emit("    add rax,rbx")
-            if node.value=="-": self.emit("    sub rax,rbx")
-            if node.value=="*": self.emit("    imul rax,rbx")
-            if node.value=="/": 
-                self.emit("    cqo")
-                self.emit("    idiv rbx")
-        elif m=="Print":
-            self.gen(node.children[0])
-            self.emit("    ; print rax (placeholder)")
-        elif m=="If":
-            cond_lbl=self.new_label("IF")
-            end_lbl=self.new_label("ENDIF")
-            self.gen(node.children[0]) # condition
-            self.emit("    cmp rax,0")
-            self.emit(f"    je {cond_lbl}")
-            self.gen(node.children[1]) # then
-            self.emit(f"    jmp {end_lbl}")
-            self.emit(f"{cond_lbl}:")
-            if len(node.children)>2: self.gen(node.children[2]) # else
+    # common x86-64 Linux syscall numbers
+    SYSCALL_MAP = {
+        "read": 0,
+        "write": 1,
+        "open": 2,
+        "close": 3,
+        "exit": 60,
+        "getpid": 39,
+    }
+
+    def __init__(self, symtab: Dict[str, FuncDef], hot_registry: HotSwapRegistry):
+        self.asm = []; self.label_counter = 0
+        self.symtab = symtab
+        self.hot_registry = hot_registry
+
+    def emit(self, s): self.asm.append(s)
+    def newlabel(self, prefix="L"): self.label_counter += 1; return f"{prefix}{self.label_counter}"
+
+    def generate(self, ast: Program, emit_pkt: bool=False, pkt_path: str="out.pkt"):
+        self.emit("section .text"); self.emit("global _start"); self.emit("_start:")
+        self.emit("  call main/0  ; entry")
+        self.emit("  mov rax, 60"); self.emit("  xor rdi, rdi"); self.emit("  syscall")
+        ast = optimize(ast)
+        for stmt in ast.body: self.gen_stmt(stmt)
+        asm = "\n".join(self.asm)
+        packed = dodecagram_pack_stream(asm)
+        if emit_pkt:
+            with open(pkt_path, "wb") as f:
+                f.write(packed)
+            print(f"Wrote packed dodecagram stream to {pkt_path} ({len(packed)} bytes)")
+        return asm + "\n\n; --- PACKED DODECAGRAM (binary stream written to file) ---\n; size_bytes=" + str(len(packed))
+
+    def gen_stmt(self, node):
+        if isinstance(node, FuncDef):
+            key = f"{node.name}/{len(node.params)}"
+            self.symtab[key] = node
+            self.hot_registry.register(key, node)
+            self.emit(f"{key}:")
+            for s in node.body: self.gen_stmt(s)
+            self.emit("  ret")
+        elif isinstance(node, Return):
+            self.gen_stmt(node.expr)
+            self.emit("  ret")
+        elif isinstance(node, Number):
+            if node.is_float:
+                self.emit(f"  ; load float {node.val} (placeholder)")
+                self.emit(f"  mov rax, {int(node.val)}")
+            else:
+                self.emit(f"  mov rax, {int(node.val)}")
+        elif isinstance(node, Var):
+            self.emit(f"  ; load var {node.name} (TODO)")
+        elif isinstance(node, Assign):
+            # simple assign: evaluate expr -> rax, then store into memory/local var (annotation)
+            self.gen_stmt(node.expr)
+            self.emit(f"  ; assign {node.name} = rax  (local)")
+        elif isinstance(node, Call):
+            key_candidate = f"{node.name}/{len(node.args)}"
+            # if maps to syscall and not a user-defined function, emit syscall inline (args -> rdi,rsi,rdx)
+            if node.name in self.SYSCALL_MAP and key_candidate not in self.symtab:
+                # evaluate args and move into rdi,rsi,rdx in order
+                regs = ["rdi","rsi","rdx","rcx","r8","r9"]
+                for i, a in enumerate(node.args):
+                    self.gen_stmt(a)
+                    reg = regs[i] if i < len(regs) else "r10"
+                    self.emit(f"  mov {reg}, rax")
+                self.emit(f"  mov rax, {self.SYSCALL_MAP[node.name]}")
+                self.emit("  syscall")
+            else:
+                for i, a in enumerate(node.args):
+                    self.gen_stmt(a)
+                    self.emit(f"  push rax  ; arg {i}")
+                if key_candidate in self.symtab:
+                    self.emit(f"  call {key_candidate}")
+                else:
+                    self.emit(f"  ; automatic link -> extern {node.name}")
+                    self.emit(f"  call {node.name}")
+                self.emit(f"  add rsp, {len(node.args) * 8}  ; clean args")
+        elif isinstance(node, BinOp):
+            self.gen_stmt(node.left); self.emit("  push rax")
+            self.gen_stmt(node.right); self.emit("  mov rbx, rax"); self.emit("  pop rax")
+            if node.op == "+": self.emit("  add rax, rbx")
+            elif node.op == "-": self.emit("  sub rax, rbx")
+            elif node.op == "*": self.emit("  imul rax, rbx")
+            elif node.op == "/":
+                dz = self.newlabel("divzero"); ed = self.newlabel("enddiv")
+                self.emit("  cmp rbx, 0"); self.emit(f"  je {dz}"); self.emit("  cqo"); self.emit("  idiv rbx"); self.emit(f"  jmp {ed}")
+                self.emit(f"{dz}:"); self.emit("  mov rax, 0  ; div by zero guard"); self.emit(f"{ed}:")
+            elif node.op == "^":
+                loop = self.newlabel("pow"); end = self.newlabel("endp")
+                self.emit("  mov rcx, rbx"); self.emit("  mov rbx, rax"); self.emit("  mov rax, 1")
+                self.emit(f"{loop}:"); self.emit("  cmp rcx, 0"); self.emit(f"  je {end}"); self.emit("  imul rax, rbx"); self.emit("  dec rcx"); self.emit(f"  jmp {loop}"); self.emit(f"{end}:")
+            else:
+                self.emit(f"  ; unhandled op {node.op}")
+        elif isinstance(node, If):
+            else_lbl = self.newlabel("else"); end_lbl = self.newlabel("endif")
+            self.gen_stmt(node.cond); self.emit("  cmp rax, 0"); self.emit(f"  je {else_lbl}")
+            for s in node.then_body: self.gen_stmt(s)
+            self.emit(f"  jmp {end_lbl}"); self.emit(f"{else_lbl}:")
+            if node.else_body:
+                for s in node.else_body: self.gen_stmt(s)
             self.emit(f"{end_lbl}:")
-        elif m=="Loop":
-            start=self.new_label("LOOP")
-            self.emit(f"{start}:")
-            for c in node.children[0].children: self.gen(c)
-            self.emit(f"    jmp {start}")
-        elif m=="DoWhile":
-            start=self.new_label("DO")
-            self.emit(f"{start}:")
-            for c in node.children[0].children: self.gen(c)
-            self.gen(node.children[1]) # condition
-            self.emit("    cmp rax,0")
-            self.emit(f"    jne {start}")
-        elif m=="Switch":
-            end=self.new_label("SWEND")
-            for case in node.children:
-                lbl=self.new_label("CASE")
-                self.emit(f"; case {case.value}")
-                self.emit(f"{lbl}:")
-                for s in case.children: self.gen(s)
-            self.emit(f"{end}:")
-        elif m=="Polynomial":
-            # naive expansion: assume x=rbx
-            self.emit("; polynomial expansion")
-            self.emit("    mov rax,rbx") # placeholder
-        elif m=="Function":
-            name=node.value
-            self.emit(f"{name}:")
-            for c in node.children: self.gen(c)
-            self.emit("    ret")
-        elif m=="Program":
-            for c in node.children: self.gen(c)
+        elif isinstance(node, Parallel):
+            self.emit("  ; PARALLEL BLOCK START (annotated)")
+            for i, s in enumerate(node.body):
+                self.emit(f"  ; parallel task {i}")
+                self.gen_stmt(s)
+            self.emit("  ; PARALLEL BLOCK END")
+        elif isinstance(node, TryCatch):
+            self.emit("  ; TRY/CATCH (annotated)")
+            for s in node.try_body: self.gen_stmt(s)
+            for s in node.catch_body: self.gen_stmt(s)
+        elif isinstance(node, Throw):
+            self.gen_stmt(node.expr); self.emit("  ; THROW (annotated)")
+        elif isinstance(node, Enum):
+            self.emit(f"  ; enum {node.name} => {node.members}")
+        elif isinstance(node, Pragma):
+            self.emit(f"  ; pragma {node.directive}")
         else:
-            self.emit(f"; unhandled node {m}")
-    def dump(self): return "\n".join(self.asm)
+            self.emit(f"  ; unhandled node {type(node).__name__}")
 
-# --------------------------
-# Demo
-# --------------------------
-if __name__=="__main__":
-    # Mock AST to test NASM gen
-    ast=ASTNode("Program","",[
-        ASTNode("Function","main",[
-            ASTNode("Block","",[
-                ASTNode("Assign","x",[ASTNode("Number","5")]),
-                ASTNode("Loop","",[ASTNode("Block","",[
-                    ASTNode("Print","",[ASTNode("Var","x")])
-                ])])
-            ])
-        ])
-    ])
+# -------------------------
+# Dodecagram packing -> binary-packed stream
+# -------------------------
+DIGITS12 = "0123456789ab"
+def bytes_to_base12_digits(data: bytes) -> List[int]:
+    digits = []
+    for b in data:
+        d1 = b // 12
+        d2 = b % 12
+        digits.append(d1)
+        digits.append(d2)
+    return digits
 
-    env=TypeEnv()
-    print("Inferred type for x:",infer_type(ast.children[0].children[0].children[0],env))
+def base12_digits_pack(digits: List[int]) -> bytes:
+    out = bytearray()
+    it = iter(digits)
+    for d1 in it:
+        try:
+            d2 = next(it)
+        except StopIteration:
+            d2 = 0
+        val = d1 * 12 + d2
+        out.append(val)
+    return bytes(out)
 
-    cg=Codegen()
-    cg.gen(ast)
-    print("\n--- NASM Output ---\n")
-    print(cg.dump())
+def dodecagram_pack_stream(asm: str) -> bytes:
+    raw = asm.encode("utf-8", errors="replace")
+    digits = bytes_to_base12_digits(raw)
+    packed = base12_digits_pack(digits)
+    header = b"DDG1" + struct.pack(">I", len(packed))
+    return header + packed
 
-class TypeEnv:
-    def __init__(self):
-        self.vars={}
-        self.enums={}
-        self.funcs={}
-    def add_enum(self,name,values):
-        self.enums[name]=values
-    def is_enum_val(self,val):
-        for enum,vals in self.enums.items():
-            if val in [f"{enum}.{v}" for v in vals]:
-                return enum
+# -------------------------
+# Linker helpers
+# -------------------------
+def load_and_parse_file(path: str):
+    with open(path, "r", encoding="utf-8") as f:
+        src = f.read()
+    toks = lex(src)
+    parser = Parser(toks)
+    ast = parser.parse()
+    return ast, parser.functions
+
+def merge_symbol_tables(main_symtab: Dict[str, FuncDef], extra_symtab: Dict[str, FuncDef]):
+    for k, v in extra_symtab.items():
+        if k not in main_symtab:
+            main_symtab[k] = v
+        else:
+            print(f"[LINKER] Symbol {k} already present; keeping primary definition")
+
+# -------------------------
+# Interpreter: closures, frames, locals, stack-frame emulation
+# -------------------------
+class Closure:
+    def __init__(self, params, body, env):
+        self.params = params
+        self.body = body
+        # captured environment (shallow copy)
+        self.env = dict(env) if env else {}
+
+class MiniRuntime:
+    def __init__(self, symtab: Dict[str, FuncDef], hot_registry: HotSwapRegistry):
+        self.symtab = symtab
+        self.hot = hot_registry
+        self.memory = {}
+        self._next_addr = 1
+        self.mutexes = {}
+        self.lock = threading.Lock()
+        # frame stack: list of dicts (locals)
+        self.frames: List[Dict[str, object]] = []
+
+    def alloc(self, size: int):
+        with self.lock:
+            addr = self._next_addr; self._next_addr += 1
+            self.memory[addr] = bytearray(size)
+        print(f"[RUNTIME] alloc -> addr={addr} size={size}")
+        return addr
+
+    def free(self, addr: int):
+        with self.lock:
+            if addr in self.memory:
+                del self.memory[addr]
+                print(f"[RUNTIME] free -> addr={addr}")
+                return True
+            print(f"[RUNTIME] free -> addr not found: {addr}")
+            return False
+
+    def mutex(self):
+        with self.lock:
+            mid = len(self.mutexes) + 1
+            self.mutexes[mid] = threading.Lock()
+        print(f"[RUNTIME] mutex -> id={mid}")
+        return mid
+
+    def mutex_lock(self, mid: int):
+        m = self.mutexes.get(mid)
+        if m:
+            m.acquire()
+            print(f"[RUNTIME] mutex_lock -> {mid}")
+            return True
+        return False
+
+    def mutex_unlock(self, mid: int):
+        m = self.mutexes.get(mid)
+        if m:
+            m.release()
+            print(f"[RUNTIME] mutex_unlock -> {mid}")
+            return True
+        return False
+
+    def push_frame(self, locals_map=None):
+        self.frames.append(locals_map or {})
+    def pop_frame(self):
+        if self.frames: self.frames.pop()
+    def current_frame(self):
+        return self.frames[-1] if self.frames else {}
+
+    def run_func(self, key: str, args: List):
+        func = self.hot.get(key) or self.symtab.get(key)
+        if not func:
+            raise Exception(f"Function {key} not found")
+        # bind params
+        frame = {}
+        for i, pname in enumerate(func.params):
+            frame[pname] = args[i] if i < len(args) else None
+        self.push_frame(frame)
+        result = None
+        for stmt in func.body:
+            result = self.eval(stmt)
+            # early return handling via Return nodes yields value
+            if isinstance(stmt, Return):
+                break
+        self.pop_frame()
+        return result
+
+    def eval(self, node):
+        if node is None: return None
+        if isinstance(node, Number): return node.val
+        if isinstance(node, Bool): return 1 if node.val else 0
+        if isinstance(node, Var):
+            # look up in frames (top-down), then env of closures if present
+            for f in reversed(self.frames):
+                if node.name in f: return f[node.name]
+            return None
+        if isinstance(node, Assign):
+            val = self.eval(node.expr)
+            # assign into current frame
+            self.current_frame()[node.name] = val
+            return val
+        if isinstance(node, Return): return self.eval(node.expr)
+        if isinstance(node, BinOp):
+            l = self.eval(node.left); r = self.eval(node.right)
+            if node.op == "+": return l + r
+            if node.op == "-": return l - r
+            if node.op == "*": return l * r
+            if node.op == "/": return 0 if r == 0 else l / r
+            if node.op == "^": return int(math.pow(l, r))
+            return None
+        if isinstance(node, Lambda):
+            # capture current frame environment shallowly
+            env = {}
+            for f in self.frames:
+                env.update(f)
+            return Closure(node.params, node.body, env)
+        if isinstance(node, Call):
+            # builtins first
+            if node.name == "print":
+                vals = [self.eval(a) for a in node.args]
+                print(*vals)
+                return None
+            if node.name == "alloc":
+                size = int(self.eval(node.args[0])) if node.args else 0
+                return self.alloc(size)
+            if node.name == "free":
+                addr = int(self.eval(node.args[0])) if node.args else 0
+                return self.free(addr)
+            if node.name == "mutex":
+                return self.mutex()
+            if node.name == "mutex_lock":
+                mid = int(self.eval(node.args[0])); return self.mutex_lock(mid)
+            if node.name == "mutex_unlock":
+                mid = int(self.eval(node.args[0])); return self.mutex_unlock(mid)
+            if node.name == "parallel":
+                def task(stmt):
+                    return self.eval(stmt)
+                with ThreadPoolExecutor(max_workers=len(node.args) or 2) as ex:
+                    futures = [ex.submit(task, a) for a in node.args]
+                    results = [f.result() for f in futures]
+                return results
+            # user function by key
+            key = f"{node.name}/{len(node.args)}"
+            # evaluate args
+            argvals = [self.eval(a) for a in node.args]
+            # check hot-swap or table or closure in current frame
+            func = self.hot.get(key) or self.symtab.get(key)
+            if func:
+                return self.run_func(key, argvals)
+            # check for closure variable in frames
+            for f in reversed(self.frames):
+                if node.name in f:
+                    candidate = f[node.name]
+                    if isinstance(candidate, Closure):
+                        # call closure: create new frame merging closure.env then parameters
+                        new_frame = dict(candidate.env)
+                        for i, pname in enumerate(candidate.params):
+                            new_frame[pname] = argvals[i] if i < len(argvals) else None
+                        self.push_frame(new_frame)
+                        result = None
+                        for stmt in candidate.body:
+                            result = self.eval(stmt)
+                            if isinstance(stmt, Return):
+                                break
+                        self.pop_frame()
+                        return result
+            raise Exception(f"Call target not found: {key}")
+        if isinstance(node, Parallel):
+            with ThreadPoolExecutor(max_workers=len(node.body) or 2) as ex:
+                futures = [ex.submit(self.eval, s) for s in node.body]
+                return [f.result() for f in futures]
+        if isinstance(node, TryCatch):
+            try:
+                for s in node.try_body: self.eval(s)
+            except Exception:
+                for s in node.catch_body: self.eval(s)
+            return None
         return None
 
-def infer_type(node,env:TypeEnv):
-    if node.nodetype=="EnumVal":
-        enum=env.is_enum_val(node.value)
-        if not enum: raise TypeError(f"Unknown enum value {node.value}")
-        return enum
-    if node.nodetype=="Polynomial":
-        return "poly"
-    # other inference from v9 ...
+# -------------------------
+# Hot-swap persistent IPC server
+# - simple JSON line protocol on localhost:4000
+#   {"op":"swap","key":"main/0","type":"const_return","value":123}
+#   {"op":"list"}
+# -------------------------
+class HotSwapServer(threading.Thread):
+    def __init__(self, host: str, port: int, hot_registry: HotSwapRegistry):
+        super().__init__(daemon=True)
+        self.host = host; self.port = port; self.hot = hot_registry
+        self.sock = None
+        self.running = True
 
-class Codegen:
-    def __init__(self):
-        self.asm=[]
-        self.label_counter=0
-    def emit(self,line): self.asm.append(line)
-    def new_label(self,base="L"): self.label_counter+=1; return f"{base}{self.label_counter}"
+    def run(self):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.bind((self.host, self.port))
+        self.sock.listen(5)
+        print(f"[HOTSWAP-SERVER] listening on {self.host}:{self.port}")
+        while self.running:
+            try:
+                conn, addr = self.sock.accept()
+            except OSError:
+                break
+            threading.Thread(target=self.handle_client, args=(conn,addr), daemon=True).start()
 
-    def gen_print(self):
-        # write syscall: write(1, rsi, rdx)
-        self.emit("    mov rdi,1        ; fd=stdout")
-        self.emit("    mov rsi,rsp      ; buf ptr (string pushed to stack)")
-        self.emit("    mov rdx,rax      ; length in rax")
-        self.emit("    mov rax,1        ; syscall write")
-        self.emit("    syscall")
+    def handle_client(self, conn: socket.socket, addr):
+        with conn:
+            data = b""
+            while True:
+                chunk = conn.recv(4096)
+                if not chunk: break
+                data += chunk
+            try:
+                payload = json.loads(data.decode("utf-8"))
+            except Exception as e:
+                conn.sendall(b'{"error":"invalid-json"}')
+                return
+            resp = self.process(payload)
+            conn.sendall(json.dumps(resp).encode("utf-8"))
 
-    def gen_polynomial(self,expr:str):
-        # Simple Horner’s method expansion x^2+3x+2
-        # Assume x in rbx, result in rax
-        self.emit("    mov rax,rbx")
-        self.emit("    imul rax,rbx")   # x^2
-        self.emit("    mov rcx,rbx")
-        self.emit("    imul rcx,3")
-        self.emit("    add rax,rcx")
-        self.emit("    add rax,2")
+    def process(self, payload: dict):
+        op = payload.get("op")
+        if op == "swap":
+            key = payload.get("key")
+            if not key: return {"ok":False, "error":"missing key"}
+            typ = payload.get("type","const_return")
+            if typ == "const_return":
+                val = payload.get("value",0)
+                new_func = FuncDef(key.split("/")[0], [], [Return(Number(str(val)))])
+                self.hot.swap(key, new_func)
+                return {"ok":True, "action":"swapped", "key":key}
+            else:
+                return {"ok":False, "error":"unsupported type"}
+        elif op == "list":
+            with self.hot.lock:
+                keys = list(self.hot.table.keys())
+            return {"ok":True, "keys":keys}
+        else:
+            return {"ok":False, "error":"unknown op"}
 
-    def gen_factorial(self,name="Factorial"):
-        self.emit(f"{name}:")
-        self.emit("    push rbp")
-        self.emit("    mov rbp,rsp")
-        self.emit("    mov rax,[rbp+16]   ; arg n")
-        self.emit("    cmp rax,0")
-        end=self.new_label("FEND")
-        self.emit(f"    je {end}")
-        self.emit("    dec rax")
-        self.emit("    push rax")
-        self.emit("    call Factorial")
-        self.emit("    mov rbx,[rbp+16]")
-        self.emit("    imul rax,rbx")
-        self.emit(f"{end}:")
-        self.emit("    pop rbp")
-        self.emit("    ret")
+    def stop(self):
+        self.running = False
+        if self.sock:
+            self.sock.close()
 
-class Optimizer:
-    def peephole(self,asm:list)->list:
-        out=[]
-        for i,line in enumerate(asm):
-            if i>0 and "mov rax,rax" in line: continue
-            out.append(line)
-        return out
+# -------------------------
+# Main: CLI, linking, hot-swap demo and run
+# -------------------------
+def main():
+    parser = argparse.ArgumentParser(prog="xyzc", description="XYZ AOT compiler (extended)")
+    parser.add_argument('infile', nargs='?', help='primary source file (or read from stdin)')
+    parser.add_argument('--link', help='comma-separated list of files to auto-link', default="")
+    parser.add_argument('--emit-asm', action='store_true', help='emit out.asm')
+    parser.add_argument('--emit-pkt', action='store_true', help='emit packed dodecagram .pkt file')
+    parser.add_argument('--hot-swap-demo', action='store_true', help='run hot-swap demo at AST/runtime level')
+    parser.add_argument('--hot-swap-server', action='store_true', help='start persistent hot-swap IPC server (localhost:4000)')
+    args = parser.parse_args()
 
-    def loop_unroll(self,ast:ASTNode)->ASTNode:
-        # detect fixed loops like for(i=0;i<4;i++)
-        # expand into repeated bodies
-        return ast
+    # load primary
+    if args.infile:
+        try:
+            with open(args.infile, 'r', encoding='utf-8') as f:
+                src = f.read()
+        except FileNotFoundError:
+            print(f"File not found: {args.infile}", file=sys.stderr); sys.exit(2)
+        toks = lex(src); parser_obj = Parser(toks); ast_main = parser_obj.parse()
+        symtab = dict(parser_obj.functions)
+    else:
+        src = sys.stdin.read(); toks = lex(src); parser_obj = Parser(toks); ast_main = parser_obj.parse(); symtab = dict(parser_obj.functions)
 
-    def const_fold(self,ast:ASTNode)->ASTNode:
-        if ast.nodetype=="BinaryOp":
-            if ast.children[0].nodetype=="Number" and ast.children[1].nodetype=="Number":
-                l=int(ast.children[0].value); r=int(ast.children[1].value)
-                val=l+r if ast.value=="+" else l-r
-                return ASTNode("Number",str(val))
-        return ast
-
-class Peephole:
-    def run(self, asm:list) -> list:
-        out=[]
-        for i,line in enumerate(asm):
-            if line.strip()=="mov rax,rax": continue
-            if i>0 and asm[i-1].startswith("push") and line.startswith("pop"):
+    # auto-link additional files
+    if args.link:
+        for path in args.link.split(","):
+            path = path.strip()
+            if not path: continue
+            try:
+                ast_extra, funcs_extra = load_and_parse_file(path)
+            except Exception as e:
+                print(f"[LINKER] failed to load {path}: {e}")
                 continue
-            out.append(line)
-        return out
+            merge_symbol_tables(symtab, funcs_extra)
+            ast_main.body.extend(ast_extra.body)
 
-class LoopUnroller:
-    def run(self, ast):
-        if ast.nodetype=="For":
-            init,cond,step,body=ast.children
-            if cond.value.startswith("i<4"):
-                # expand 4 iterations
-                unrolled=ASTNode("Block","")
-                for _ in range(4): unrolled.children+=body.children
-                return unrolled
-        return ast
+    # hot-swap registry
+    hot_registry = HotSwapRegistry()
+    for k, v in list(symtab.items()):
+        hot_registry.register(k, v)
 
-class ConstFolder:
-    def fold(self,node):
-        if node.nodetype=="BinaryOp":
-            l=node.children[0]; r=node.children[1]
-            if l.nodetype=="Number" and r.nodetype=="Number":
-                lv=float(l.value); rv=float(r.value)
-                if node.value=="+": return ASTNode("Number",str(lv+rv))
-                if node.value=="*": return ASTNode("Number",str(lv*rv))
-        return node
+    # optional persistent hot-swap server
+    server = None
+    if args.hot_swap_server:
+        server = HotSwapServer("127.0.0.1", 4000, hot_registry)
+        server.start()
 
-class Inliner:
-    def run(self, call_node, func_defs):
-        fn=func_defs.get(call_node.value)
-        if fn and len(fn.children[1].children)<5:  # heuristic
-            return fn.children[1]  # inline block
-        return call_node
+    # codegen
+    cg = Codegen(symtab, hot_registry)
+    pkt_path = "out.pkt"
+    asm = cg.generate(ast_main, emit_pkt=args.emit_pkt, pkt_path=pkt_path if args.emit_pkt else "out.pkt")
+    if args.emit_asm:
+        open("out.asm", "w", encoding="utf-8").write(asm)
+        print("Wrote out.asm")
 
-class CIAM:
-    corrections = {"prnt":"print","pritn":"print"}
-    macros = {"SAFEADD":"( (x)!=null && (y)!=null ? (x)+(y) : 0 )"}
-    def expand(self,node):
-        if node.nodetype=="Ident" and node.value in self.corrections:
-            node.value=self.corrections[node.value]
-        if node.nodetype=="MacroCall" and node.value=="SAFEADD":
-            x,y=node.children
-            return ASTNode("BinaryOp","+",
-                [ASTNode("Var",x.value),ASTNode("Var",y.value)])
-        return node
+    print("Compiled -> out.asm (in-memory); symtab entries:", len(symtab))
+
+    # runtime demo hooks
+    runtime = MiniRuntime(symtab, hot_registry)
+
+    if args.hot_swap_demo:
+        try:
+            res_before = runtime.run_func("main/0", [])
+            print("[DEMO] main/0 before hot-swap ->", res_before)
+        except Exception:
+            print("[DEMO] main/0 not runnable before hot-swap")
+
+        new_body = [Return(Number("123"))]
+        new_func = FuncDef("main", [], new_body)
+        hot_registry.swap("main/0", new_func)
+        res_after = runtime.run_func("main/0", [])
+        print("[DEMO] main/0 after hot-swap ->", res_after)
+
+    # execute top-level parallels and simple calls to exercize runtime
+    for node in ast_main.body:
+        if isinstance(node, Parallel):
+            print("[RUNTIME] executing top-level Parallel block")
+            runtime.eval(node)
+        if isinstance(node, Call) and node.name in ("alloc","mutex"):
+            runtime.eval(node)
+
+    # keep server alive if started (until user kills)
+    if server:
+        try:
+            print("[HOTSWAP-SERVER] running; send JSON to localhost:4000 and close connection to submit")
+            server.join()
+        except KeyboardInterrupt:
+            server.stop()
+
+if __name__ == "__main__":
+    main()
 
