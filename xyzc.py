@@ -3409,3 +3409,261 @@ def main():
 
 if __name__=="__main__": main()
 
+#!/usr/bin/env python3
+# xyzc.py — XYZ Bootstrap Compiler
+# SIMD + CUDA + OpenCL + AVX2/Numba fallback + MacroEngine + Benchmarks
+import sys, time, numpy as np
+import pycuda.driver as cuda, pycuda.autoinit, pycuda.compiler
+import pyopencl as cl
+from numba import njit, prange
+
+# ----------------------------
+# AST NODES
+# ----------------------------
+class ASTNode:
+    def __init__(self, kind, name=None, value=None, children=None):
+        self.kind = kind
+        self.name = name
+        self.value = value
+        self.children = children if children else []
+    def __repr__(self): return f"<{self.kind}:{self.name or self.value}>"
+
+# ----------------------------
+# LEXER
+# ----------------------------
+class Lexer:
+    def __init__(self, src): self.src = src
+    def tokenize(self):
+        tokens, cur = [], ""
+        for ch in self.src:
+            if ch.isspace():
+                if cur: tokens.append(cur); cur = ""
+            elif ch in "()[]{},":
+                if cur: tokens.append(cur); cur = ""
+                tokens.append(ch)
+            else: cur += ch
+        if cur: tokens.append(cur)
+        return tokens
+
+# ----------------------------
+# PARSER
+# ----------------------------
+class Parser:
+    def __init__(self, tokens): self.tokens = tokens; self.pos = 0
+    def peek(self): return self.tokens[self.pos] if self.pos < len(self.tokens) else None
+    def consume(self): tok = self.peek(); self.pos += 1; return tok
+
+    def parse(self):
+        nodes = []
+        while self.peek():
+            if self.peek() == "Item": nodes.append(self.parse_item())
+            elif self.peek() == "run": nodes.append(self.parse_run())
+            else: self.consume()
+        return ASTNode("Program", children=nodes)
+
+    def parse_item(self):
+        self.consume()  # Item
+        name = self.consume(); self.consume(); self.consume()  # ( )
+        body = []
+        while self.peek() and self.peek() not in ["Item", "run"]:
+            tok = self.consume()
+            if tok == "let":
+                var = self.consume(); self.consume(); val = self.consume()
+                body.append(ASTNode("Let", name=var, value=val))
+            elif tok == "trait":
+                tname = self.consume(); self.consume(); val = self.consume(); self.consume()
+                body.append(ASTNode("Trait", name=tname, value=val))
+            elif tok == "apply":
+                target = self.consume(); self.consume(); args=[]
+                while self.peek() != ")": args.append(self.consume())
+                self.consume(); body.append(ASTNode("Apply", name=target, value=args))
+            elif tok == "dispatch":
+                target = self.consume(); self.consume(); args=[]
+                while self.peek() != ")": args.append(self.consume())
+                self.consume(); body.append(ASTNode("Dispatch", name=target, value=args))
+        return ASTNode("Item", name=name, children=body)
+
+    def parse_run(self):
+        self.consume(); target = self.consume(); self.consume(); self.consume()
+        return ASTNode("Run", name=target)
+
+# ----------------------------
+# MACROENGINE (Symbolic Shader Fusion)
+# ----------------------------
+class MacroEngine:
+    def __init__(self): self.macros = {}
+    def register(self, name, func): self.macros[name] = func
+    def expand(self, name, *args):
+        if name in self.macros:
+            return self.macros[name](*args)
+        raise Exception(f"Macro {name} not found")
+
+macro_engine = MacroEngine()
+
+# Example: shader fusion macro
+macro_engine.register("fuse_shader", lambda a,b: f"// fused shader: {a}+{b}")
+
+# ----------------------------
+# GPU DISPATCHER
+# ----------------------------
+class GPUDispatcher:
+    def __init__(self): self.cuda_module=None; self.cl_context=None; self.cl_queue=None; self.cl_program=None
+    def load_cuda(self, ptx="force.auto.ptx"):
+        self.cuda_module = pycuda.compiler.SourceModule(open(ptx).read())
+        print("[GPU] CUDA PTX loaded")
+    def load_opencl(self, cl_file="force.auto.cl"):
+        ctx=cl.create_some_context(); queue=cl.CommandQueue(ctx)
+        src=open(cl_file).read(); prog=cl.Program(ctx, src).build()
+        self.cl_context, self.cl_queue, self.cl_program = ctx, queue, prog
+        print("[GPU] OpenCL kernel built")
+    def launch_cuda(self,pos,vel,g):
+        n=len(pos); pos_gpu=cuda.mem_alloc(pos.nbytes); vel_gpu=cuda.mem_alloc(vel.nbytes)
+        cuda.memcpy_htod(pos_gpu,pos); cuda.memcpy_htod(vel_gpu,vel)
+        func=self.cuda_module.get_function("apply_force"); threads=256; blocks=(n+threads-1)//threads
+        func(pos_gpu,vel_gpu,np.float32(g),np.int32(n),block=(threads,1,1),grid=(blocks,1))
+        cuda.memcpy_dtoh(pos,pos_gpu); cuda.memcpy_dtoh(vel,vel_gpu); return pos,vel
+    def launch_opencl(self,pos,vel,g):
+        n=len(pos); mf=cl.mem_flags; ctx=self.cl_context; queue=self.cl_queue
+        pos_buf=cl.Buffer(ctx,mf.READ_WRITE|mf.COPY_HOST_PTR,hostbuf=pos)
+        vel_buf=cl.Buffer(ctx,mf.READ_WRITE|mf.COPY_HOST_PTR,hostbuf=vel)
+        self.cl_program.apply_force(queue,(n,),None,pos_buf,vel_buf,np.float32(g),np.int32(n))
+        cl.enqueue_copy(queue,pos,pos_buf).wait(); cl.enqueue_copy(queue,vel,vel_buf).wait()
+        return pos,vel
+
+# ----------------------------
+# AVX2 ACCELERATION VIA NUMBA (CPU Fallback)
+# ----------------------------
+@njit(parallel=True, fastmath=True)
+def cpu_force(pos, vel, g):
+    n = pos.shape[0]
+    for i in prange(n):
+        vel[i] += g
+        pos[i] += vel[i]
+    return pos, vel
+
+# ----------------------------
+# RAPID CHECKOUT SNAPSHOT (REPL Stub)
+# ----------------------------
+class RapidCheckoutSnapshot:
+    def __init__(self): self.buffer=[]
+    def record(self, code): self.buffer.append(code)
+    def replay(self): return "\n".join(self.buffer)
+    def launch_repl(self): print(">>> XYZ REPL (type 'exit' to quit)"); 
+    # (Stub: integrate later with live IDE)
+
+# ----------------------------
+# BENCHMARKING SUITE
+# ----------------------------
+def benchmark(n=10**6, g=9.8):
+    pos=np.zeros(n,dtype=np.float32); vel=np.zeros(n,dtype=np.float32)
+    print(f"[Bench] Size={n}")
+    # CPU AVX2 (Numba JIT)
+    t0=time.time(); pos,vel=cpu_force(pos,vel,g); t1=time.time()
+    print(f"[CPU-AVX2] {n} elems in {t1-t0:.6f}s → {(2*n)/(t1-t0):.2e} FLOP/s")
+
+    # GPU CUDA (if available)
+    try:
+        gpu=GPUDispatcher(); gpu.load_cuda("force.auto.ptx")
+        pos=np.zeros(n,dtype=np.float32); vel=np.zeros(n,dtype=np.float32)
+        t0=time.time(); pos,vel=gpu.launch_cuda(pos,vel,g); t1=time.time()
+        print(f"[CUDA] {n} elems in {t1-t0:.6f}s → {(2*n)/(t1-t0):.2e} FLOP/s")
+    except Exception as e:
+        print("[CUDA unavailable]", e)
+
+    # GPU OpenCL (if available)
+    try:
+        gpu=GPUDispatcher(); gpu.load_opencl("force.auto.cl")
+        pos=np.zeros(n,dtype=np.float32); vel=np.zeros(n,dtype=np.float32)
+        t0=time.time(); pos,vel=gpu.launch_opencl(pos,vel,g); t1=time.time()
+        print(f"[OpenCL] {n} elems in {t1-t0:.6f}s → {(2*n)/(t1-t0):.2e} FLOP/s")
+    except Exception as e:
+        print("[OpenCL unavailable]", e)
+
+# ----------------------------
+# MAIN DRIVER
+# ----------------------------
+def main():
+    if len(sys.argv)<2:
+        print("Usage: xyzc.py file.xyz"); sys.exit(1)
+    src=open(sys.argv[1]).read()
+    lexer=Lexer(src); parser=Parser(lexer.tokenize()); ast=parser.parse()
+    # Macro usage example
+    fused=macro_engine.expand("fuse_shader","force","gravity")
+    print("[MacroEngine]",fused)
+
+    # Benchmark FastRuntime
+    benchmark(n=10**5)
+
+if __name__=="__main__": main()
+
+import json, time, os
+from datetime import datetime
+
+class RapidCheckoutSnapshot:
+    def __init__(self, session_name="xyz_session"):
+        self.snapshots = []
+        self.session_name = session_name
+        self.file = f"{session_name}.rcs.json"
+
+    # --- Core snapshot mechanics ---
+    def record(self, code, context="REPL"):
+        snap = {
+            "timestamp": datetime.utcnow().isoformat(),
+            "context": context,
+            "code": code
+        }
+        self.snapshots.append(snap)
+        print(f"[Snapshot] Recorded ({context}) at {snap['timestamp']}")
+
+    def save(self):
+        with open(self.file, "w") as f:
+            json.dump(self.snapshots, f, indent=2)
+        print(f"[Snapshot] Saved to {self.file}")
+
+    def load(self):
+        if os.path.exists(self.file):
+            self.snapshots = json.load(open(self.file))
+            print(f"[Snapshot] Loaded {len(self.snapshots)} from {self.file}")
+
+    # --- Live REPL ---
+    def launch_repl(self, compiler):
+        print(">>> XYZ Live REPL (type 'exit' to quit, ':history' for snapshots, ':save', ':load')")
+        while True:
+            try:
+                line = input("xyz> ")
+                if line.strip() == "exit":
+                    break
+                elif line.strip() == ":history":
+                    for i, snap in enumerate(self.snapshots):
+                        print(f"[{i}] {snap['timestamp']} {snap['context']}: {snap['code']}")
+                    continue
+                elif line.strip() == ":save":
+                    self.save(); continue
+                elif line.strip() == ":load":
+                    self.load(); continue
+                elif line.strip().startswith(":replay"):
+                    parts = line.split()
+                    if len(parts) > 1:
+                        idx = int(parts[1])
+                        self.replay(idx, compiler)
+                    else:
+                        self.replay(len(self.snapshots)-1, compiler)
+                    continue
+
+                # Normal REPL command
+                self.record(line, context="REPL")
+                compiler.run_snippet(line)
+
+            except KeyboardInterrupt:
+                break
+
+    # --- Replay snapshots ---
+    def replay(self, idx, compiler):
+        if idx < 0 or idx >= len(self.snapshots):
+            print("[Snapshot] Invalid index")
+            return
+        snap = self.snapshots[idx]
+        print(f"[Snapshot] Replaying {idx}: {snap['code']}")
+        compiler.run_snippet(snap["code"])
+
+
