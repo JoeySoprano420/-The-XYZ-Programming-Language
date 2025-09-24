@@ -1,4 +1,23 @@
-libxyzrt/
- ├── libxyzrt.h
- ├── libxyzrt.c
- └── Makefile
+xyz-lang/
+├── README.md
+├── xyzc.            ; CLI Entry
+├── core/
+│   ├── lexer.xyz
+│   ├── parser.xyz
+│   ├── optimizer.xyz
+│   ├── codegen.xyz
+│   ├── linker.xyz
+│   ├── runtime.xyz
+│   └── ast.xyz
+├── lib/
+│   ├── math.xyz
+│   ├── poly.xyz
+│   └── threads.xyz
+├── tests/
+│   ├── test_poly.xyz
+│   ├── test_lambda.xyz
+│   └── test_fib.xyz
+└── examples/
+    ├── hello.xyz
+    ├── poly_deriv.xyz
+    └── parallel_fib.xyz
