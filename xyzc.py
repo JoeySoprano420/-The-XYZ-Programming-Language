@@ -10,6 +10,7 @@
 #
 # The file preserves previous features (hot-swap, linker, codegen, packetizer).
 
+from mimetypes import init
 import sys, re, argparse, math, threading, struct, json, socket, copy, difflib, time, random, traceback
 from typing import List, Dict, Any, Tuple
 from concurrent.futures import ThreadPoolExecutor
@@ -1253,7 +1254,7 @@ TokenSpec = [
 TokenRegex = re.compile('|'.join(f'(?P<{name}>{pattern})' for name, pattern in TokenSpec))
 @dataclass
 class Token:
-    type: TokenType
+    type: init= TokenType
     value: str
     line: int
     column: int
@@ -1456,3 +1457,39 @@ def produce_and_link_example(cg: Codegen, ast: Program, primary_obj="primary.obj
 
 # EOF appended helpers
 
+def compile_and_run_xyz(source_code: str, emit_obj: bool = True, emit_asm: bool = True, run: bool = True):
+    # Lex and parse
+    tokens = lex(source_code)
+    parser = Parser(tokens)
+    ast = parser.parse()
+    symtab = dict(parser.functions)
+
+    # Hot-swap registry
+    hot_registry = HotSwapRegistry()
+    for k, v in symtab.items():
+        hot_registry.register(k, v)
+
+    # Codegen
+    cg = Codegen(symtab, hot_registry)
+    asm = cg.generate(ast)
+
+    # Emit object file
+    obj_path = "temp.obj"
+    if emit_obj:
+        cg.emit_object(asm, obj_path)
+
+    # Link to final NASM
+    asm_path = "final.asm"
+    if emit_asm:
+        cg.link_objects([obj_path], asm_path)
+
+    # Execute via MiniRuntime
+    if run:
+        runtime = MiniRuntime(symtab, hot_registry)
+        try:
+            result = runtime.run_func("main/0", [])
+            print(f"[XYZ] Execution result: {result}")
+        except Exception as e:
+            print(f"[XYZ] Runtime error: {e}")
+
+           
