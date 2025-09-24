@@ -4,6 +4,96 @@
 
 ---
 
+🧠 Language Features Supported
+✅ Item-Oriented Constructs
+
+Functions, variables, assignments, calls, returns
+
+Lists, maps, indexing with bounds/type checking
+
+Enums, pragmas, lambdas, and dotted method/field access
+
+✅ Control Flow
+
+If/else, while, for loops
+
+Try/catch, throw, isolate, force, remove
+
+Parallel blocks with thread pool execution
+
+✅ Memory & Mutex Primitives
+
+alloc, free, mutex, mutex_lock, mutex_unlock
+
+✅ Built-in Print and Eval
+
+print for output
+
+eval("expression") for runtime evaluation
+
+🔧 Compiler Pipeline
+1. Lexer & Parser
+
+Tokenizes and parses XYZ source into AST
+
+Supports extended grammar including containers and control structures
+
+2. Codegen
+
+Emits NASM x64 assembly directly
+
+Auto-links known syscalls and libc functions (e.g. printf, malloc)
+
+Packs output into dodecagram binary stream
+
+3. Object Emitter & Linker
+
+Emits object files as JSON symbol maps
+
+Links multiple object files into final .asm with externs and trace comments
+
+4. Runtime Execution
+
+MiniRuntime: interpreted execution with stack frames and closures
+
+FastVM: bytecode compiler + optimized VM with hot-path inlining and memory pooling
+
+5. Hot-Swap System
+
+IPC server on localhost:4000
+
+Accepts JSON payloads to swap function bodies at runtime
+
+Supports live patching and demo mode
+
+🚀 Execution Flow
+You can now run:
+
+bash
+python xyzc.py mycode.xyz --emit-asm --hot-swap-server
+And it will:
+
+Compile mycode.xyz to NASM
+
+Emit out.asm and optionally out.pkt
+
+Start a hot-swap server for live updates
+
+Execute main/0 via MiniRuntime or FastVM
+
+🧪 Bonus Capabilities
+Parallel execution of tasks via thread pool
+
+Constant folding optimizer
+
+Dodecagram packing for binary stream output
+
+FastVM fallback to interpreter for unhandled opcodes
+
+Inline caching and hot-path optimization
+
+---
+
 ## 🔹 Core Identity
 
 XYZ is a **next-generation systems and application language** designed for **direct NASM mapping** with **Ahead-of-Time (AOT) compilation**. It eliminates external toolchains by being **self-contained** and **self-optimizing**, allowing developers to focus entirely on *what* to build rather than *how* to manage toolchains, linking, or optimization flags.
