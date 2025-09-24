@@ -11,13 +11,567 @@
 # The file preserves previous features (hot-swap, linker, codegen, packetizer).
 
 from mimetypes import init
-import sys, re, argparse, math, threading, struct, json, socket, copy, difflib, time, random, traceback
-from typing import List, Dict, Any, Tuple
+import sys, re, argparse, math, threading, struct, json, socket
+from typing import List, Dict, Any
 from concurrent.futures import ThreadPoolExecutor
 
 # -------------------------
 # LEXER (add brackets)
 # -------------------------
+# Professional pipeline additions (parser, AST, semantic analysis, IR, codegen, runtime)
+# Appended as opt-in modules: use ProCompiler.pro_compile_and_run(source) to exercise.
+# Designed to integrate with existing toolchain without replacing current code.
+
+from dataclasses import dataclass, field
+from enum import Enum, auto
+from typing import Optional, List, Dict, Any, Tuple, Union, Iterable
+
+# -------------------------
+# Pro AST (dataclasses)
+# -------------------------
+@dataclass
+class PNode:
+    pass
+
+@dataclass
+class PProgram(PNode):
+    body: List[PNode] = field(default_factory=list)
+
+@dataclass
+class PFunc(PNode):
+    name: str
+    params: List[str]
+    body: List[PNode]
+    ret_type: Optional['PType'] = None
+
+@dataclass
+class PReturn(PNode):
+    expr: Optional[PNode]
+
+@dataclass
+class PCall(PNode):
+    target: Union[str, PNode]
+    args: List[PNode]
+
+@dataclass
+class PVar(PNode):
+    name: str
+
+@dataclass
+class PAssign(PNode):
+    name: str
+    expr: PNode
+
+@dataclass
+class PNumber(PNode):
+    raw: str
+
+@dataclass
+class PBool(PNode):
+    val: bool
+
+@dataclass
+class PBinOp(PNode):
+    op: str
+    left: PNode
+    right: PNode
+
+@dataclass
+class PIf(PNode):
+    cond: PNode
+    then_body: List[PNode]
+    else_body: List[PNode]
+
+@dataclass
+class PWhile(PNode):
+    cond: PNode
+    body: List[PNode]
+
+@dataclass
+class PListLiteral(PNode):
+    elements: List[PNode]
+
+@dataclass
+class PIndex(PNode):
+    base: PNode
+    index: PNode
+
+@dataclass
+class PLambda(PNode):
+    params: List[str]
+    body: List[PNode]
+
+# -------------------------
+# Pro Types
+# -------------------------
+class PType:
+    pass
+
+@dataclass
+class TInt(PType): pass
+
+@dataclass
+class TFloat(PType): pass
+
+@dataclass
+class TBool(PType): pass
+
+@dataclass
+class TNull(PType): pass
+
+@dataclass
+class TAny(PType): pass
+
+@dataclass
+class TList(PType):
+    elem: PType
+
+@dataclass
+class TFunc(PType):
+    params: List[PType]
+    ret: PType
+
+# -------------------------
+# Pro Lexer (lightweight, robust)
+# -------------------------
+ProToken = Tuple[str,str]  # (kind, value)
+
+class ProLexer:
+    token_spec = [
+        ('NUMBER', r'-?\d+(\.\d+)?'),
+        ('ID',     r'[A-Za-z_][A-Za-z0-9_]*'),
+        ('STRING', r'"[^"]*"|\'[^\']*\''),
+        ('OP',     r'[\+\-\*/\^=<>!&|\.]+'),
+        ('LP',     r'\('), ('RP', r'\)'),
+        ('LB',     r'\['), ('RB', r'\]'),
+        ('LBRA',   r'\{'), ('RBRA', r'\}'),
+        ('COMMA',  r','), ('SEMI', r';'),
+        ('WS',     r'\s+'),
+        ('MISM',   r'.'),
+    ]
+    regex = re.compile('|'.join(f'(?P<{n}>{p})' for n,p in token_spec))
+    keywords = set(["func","return","if","else","while","for","lambda","true","false","null","parallel","try","catch","throw","enum","eval","alloc","free","print","isolate","force","remove"])
+    def __init__(self, src: str):
+        self.src = src
+        self.pos = 0
+        self.tokens: List[ProToken] = []
+        self._lex_all()
+        self.i = 0
+    def _lex_all(self):
+        for m in self.regex.finditer(self.src):
+            kind = m.lastgroup; val = m.group()
+            if kind == 'WS': continue
+            if kind == 'ID' and val in self.keywords:
+                kind = val.upper()
+            self.tokens.append((kind,val))
+    def peek(self):
+        return self.tokens[self.i] if self.i < len(self.tokens) else ('EOF','')
+    def next(self):
+        t = self.peek(); self.i += 1; return t
+    def accept(self, kind):
+        if self.peek()[0] == kind:
+            return self.next()
+        return None
+    def expect(self, kind):
+        t = self.next()
+        if t[0] != kind:
+            raise SyntaxError(f"Expected {kind} got {t}")
+        return t
+
+# -------------------------
+# Pro Parser (recursive-descent, more professional)
+# -------------------------
+class ProParser:
+    def __init__(self, src: str):
+        self.lex = ProLexer(src)
+    def parse(self) -> PProgram:
+        body = []
+        while self.lex.peek()[0] != 'EOF':
+            if self.lex.peek()[0] == 'func':
+                body.append(self.parse_func())
+            else:
+                stmt = self.parse_stmt()
+                if stmt: body.append(stmt)
+        return PProgram(body)
+    def parse_func(self) -> PFunc:
+        self.lex.expect('func')
+        _, name = self.lex.expect('ID')
+        self.lex.expect('LP')
+        params=[]
+        if self.lex.peek()[0] != 'RP':
+            while True:
+                _, pid = self.lex.expect('ID'); params.append(pid)
+                if self.lex.accept('COMMA'): continue
+                break
+        self.lex.expect('RP'); self.lex.expect('LBRA')
+        body=[]
+        while self.lex.peek()[0] != 'RBRA':
+            body.append(self.parse_stmt())
+        self.lex.expect('RBRA')
+        return PFunc(name, params, body)
+    def parse_stmt(self) -> PNode:
+        t = self.lex.peek()
+        if t[0] == 'return':
+            self.lex.next()
+            expr = self.parse_expr()
+            self.lex.accept('SEMI')
+            return PReturn(expr)
+        if t[0] == 'LBRA':
+            self.lex.next(); # block inline -- treat as sequence
+            stmts=[]
+            while self.lex.peek()[0] != 'RBRA':
+                stmts.append(self.parse_stmt())
+            self.lex.expect('RBRA')
+            return PProgram(stmts)
+        # assignment or expression
+        expr = self.parse_expr()
+        if isinstance(expr, PVar) and self.lex.peek()[0] == 'OP' and self.lex.peek()[1] == '=':
+            self.lex.next(); val = self.parse_expr(); self.lex.accept('SEMI'); return PAssign(expr.name, val)
+        self.lex.accept('SEMI')
+        return expr
+    def parse_expr(self, rbp=0) -> PNode:
+        # Pratt parser for expressions
+        tkind, tval = self.lex.next()
+        left = self.nud(tkind,tval)
+        while rbp < self.lbp(self.lex.peek()):
+            opkind, opval = self.lex.next()
+            left = self.led(opkind, opval, left)
+        return left
+    def nud(self, kind, val):
+        if kind == 'NUMBER':
+            return PNumber(val)
+        if kind == 'true':
+            return PBool(True)
+        if kind == 'false':
+            return PBool(False)
+        if kind == 'ID':
+            # variable or call
+            if self.lex.peek()[0] == 'LP':
+                # call
+                self.lex.next()  # eat LP
+                args=[]
+                if self.lex.peek()[0] != 'RP':
+                    while True:
+                        args.append(self.parse_expr())
+                        if self.lex.accept('COMMA'): continue
+                        break
+                self.lex.expect('RP')
+                return PCall(val, args)
+            return PVar(val)
+        if kind == 'LP':
+            e = self.parse_expr()
+            self.lex.expect('RP')
+            return e
+        if kind == 'LB':
+            # list literal recorded as LBRA token earlier in token set? treat LB as LBRACE
+            elems=[]
+            while self.lex.peek()[0] != 'RB':
+                elems.append(self.parse_expr())
+                if self.lex.accept('COMMA'): continue
+                break
+            self.lex.expect('RB')
+            return PListLiteral(elems)
+        raise SyntaxError(f"Unexpected token in nud: {kind} {val}")
+    def lbp(self, peek):
+        k = peek()[0] if callable(peek) else peek[0]
+        if k == 'OP':
+            return 10
+        if k == 'LP':
+            return 20
+        return 0
+    def led(self, kind, val, left):
+        if kind == 'OP':
+            # binary
+            right = self.parse_expr(10)
+            return PBinOp(val, left, right)
+        if kind == 'LP':
+            # function-call via expression (e.g., (f)(args)) — not commonly used
+            args=[]
+            if self.lex.peek()[0] != 'RP':
+                while True:
+                    args.append(self.parse_expr())
+                    if self.lex.accept('COMMA'): continue
+                    break
+            self.lex.expect('RP')
+            return PCall(left, args)
+        raise SyntaxError(f"Unexpected led: {kind}")
+
+# -------------------------
+# Pro Semantic Analyzer / TypeChecker (basic professional)
+# -------------------------
+class SemanticError(Exception): pass
+
+class ProSymbolTable:
+    def __init__(self):
+        self.scopes: List[Dict[str, PType]] = [{}]
+    def push(self): self.scopes.append({})
+    def pop(self): self.scopes.pop()
+    def declare(self, name: str, typ: PType):
+        self.scopes[-1][name] = typ
+    def lookup(self, name: str) -> Optional[PType]:
+        for s in reversed(self.scopes):
+            if name in s: return s[name]
+        return None
+
+class TypeChecker:
+    def __init__(self, program: PProgram):
+        self.program = program
+        self.sym = ProSymbolTable()
+        self.func_types: Dict[str, TFunc] = {}
+    def check(self):
+        # first pass: register function signatures
+        for node in self.program.body:
+            if isinstance(node, PFunc):
+                # default params any, ret any
+                param_ts = [TAny() for _ in node.params]
+                self.func_types[f"{node.name}/{len(node.params)}"] = TFunc(param_ts, TAny())
+                self.sym.declare(node.name, self.func_types[f"{node.name}/{len(node.params)}"])
+        # second pass: check bodies
+        for node in self.program.body:
+            if isinstance(node, PFunc):
+                self.check_func(node)
+    def check_func(self, fn: PFunc):
+        sig = self.func_types.get(f"{fn.name}/{len(fn.params)}")
+        assert sig is not None
+        self.sym.push()
+        for i,p in enumerate(fn.params):
+            self.sym.declare(p, sig.params[i])
+        ret_type: PType = sig.ret
+        for stmt in fn.body:
+            self.check_node(stmt)
+        self.sym.pop()
+    def check_node(self, node: PNode) -> PType:
+        if isinstance(node, PNumber):
+            return TInt() if '.' not in node.raw else TFloat()
+        if isinstance(node, PBool):
+            return TBool()
+        if isinstance(node, PVar):
+            t = self.sym.lookup(node.name)
+            if t is None:
+                raise SemanticError(f"Undefined variable {node.name}")
+            return t
+        if isinstance(node, PAssign):
+            t = self.check_node(node.expr)
+            self.sym.declare(node.name, t)
+            return t
+        if isinstance(node, PBinOp):
+            lt = self.check_node(node.left); rt = self.check_node(node.right)
+            # arithmetic rules
+            if isinstance(lt, TFloat) or isinstance(rt, TFloat):
+                return TFloat()
+            if isinstance(lt, TInt) and isinstance(rt, TInt):
+                return TInt()
+            return TAny()
+        if isinstance(node, PCall):
+            # resolve target
+            if isinstance(node.target, str):
+                key = f"{node.target}/{len(node.args)}"
+                ft = self.func_types.get(key)
+                if ft:
+                    # check args
+                    for a,pt in zip(node.args, ft.params):
+                        at = self.check_node(a)
+                        # allow Any
+                    return ft.ret
+                # builtins
+                if node.target == "print":
+                    for a in node.args: self.check_node(a)
+                    return TNull()
+            else:
+                # dynamic call expression (callable result)
+                return TAny()
+            raise SemanticError(f"Unknown function {node.target}")
+        if isinstance(node, PReturn):
+            if node.expr:
+                return self.check_node(node.expr)
+            return TNull()
+        if isinstance(node, PListLiteral):
+            if not node.elements: return TList(TAny())
+            et = self.check_node(node.elements[0])
+            return TList(et)
+        if isinstance(node, PIf):
+            self.check_node(node.cond)
+            for s in node.then_body: self.check_node(s)
+            for s in node.else_body: self.check_node(s)
+            return TNull()
+        if isinstance(node, PWhile):
+            self.check_node(node.cond)
+            for s in node.body: self.check_node(s)
+            return TNull()
+        return TAny()
+
+# -------------------------
+# Simple IR + IR Builder + Codegen (professional structure)
+# -------------------------
+class IROp(Enum):
+    CONST = auto()
+    LOAD = auto()
+    STORE = auto()
+    ADD = auto()
+    SUB = auto()
+    MUL = auto()
+    DIV = auto()
+    CALL = auto()
+    RET = auto()
+    LIST = auto()
+    INDEX = auto()
+
+@dataclass
+class IRInstr:
+    op: IROp
+    args: Tuple[Any,...]
+    dst: Optional[str] = None
+
+class IRBuilder:
+    def __init__(self):
+        self.instrs: List[IRInstr] = []
+        self.tmp = 0
+    def new_tmp(self):
+        self.tmp += 1; return f"%t{self.tmp}"
+    def emit(self, op: IROp, args: Tuple[Any,...], dst: Optional[str]=None):
+        instr = IRInstr(op,args,dst)
+        self.instrs.append(instr); return instr
+    def lower_program(self, prog: PProgram) -> Dict[str, List[IRInstr]]:
+        funcs = {}
+        for n in prog.body:
+            if isinstance(n, PFunc):
+                self.tmp = 0; self.instrs = []
+                self.lower_func(n)
+                funcs[f"{n.name}/{len(n.params)}"] = list(self.instrs)
+        return funcs
+    def lower_func(self, fn: PFunc):
+        # lower statements to IR
+        for s in fn.body:
+            self.lower_stmt(s)
+    def lower_stmt(self, s: PNode):
+        if isinstance(s, PReturn):
+            if s.expr:
+                dst = self.lower_expr(s.expr)
+                self.emit(IROp.RET, (dst,))
+            else:
+                self.emit(IROp.RET, (None,))
+        elif isinstance(s, PAssign):
+            val = self.lower_expr(s.expr)
+            self.emit(IROp.STORE, (s.name,val))
+        else:
+            # expression stmt
+            self.lower_expr(s)
+    def lower_expr(self, e: PNode) -> Any:
+        if isinstance(e, PNumber):
+            dst = self.new_tmp(); self.emit(IROp.CONST, (float(e.raw) if '.' in e.raw else int(e.raw),), dst); return dst
+        if isinstance(e, PBool):
+            dst = self.new_tmp(); self.emit(IROp.CONST, (1 if e.val else 0,), dst); return dst
+        if isinstance(e, PVar):
+            dst = self.new_tmp(); self.emit(IROp.LOAD,(e.name,),dst); return dst
+        if isinstance(e, PBinOp):
+            l = self.lower_expr(e.left); r = self.lower_expr(e.right)
+            dst = self.new_tmp()
+            opmap = {'+': IROp.ADD,'-': IROp.SUB,'*': IROp.MUL,'/': IROp.DIV}
+            self.emit(opmap.get(e.op, IROp.ADD),(l,r),dst); return dst
+        if isinstance(e, PCall):
+            args = [self.lower_expr(a) for a in e.args]
+            dst = self.new_tmp()
+            tgt = e.target if isinstance(e.target,str) else None
+            self.emit(IROp.CALL,(tgt,tuple(args)),dst); return dst
+        if isinstance(e, PListLiteral):
+            items = [self.lower_expr(it) for it in e.elements]
+            dst = self.new_tmp(); self.emit(IROp.LIST,(tuple(items),),dst); return dst
+        if isinstance(e, PIndex):
+            b = self.lower_expr(e.base); i = self.lower_expr(e.index)
+            dst = self.new_tmp(); self.emit(IROp.INDEX,(b,i),dst); return dst
+        if isinstance(e, PLambda):
+            # lambdas lowered to callable via runtime; return Any placeholder
+            dst = self.new_tmp(); self.emit(IROp.CONST, ("<lambda>",),dst); return dst
+        return None
+
+# -------------------------
+# Execution Engine for IR
+# -------------------------
+class ExecutionEngine:
+    def __init__(self, funcs_ir: Dict[str, List[IRInstr]], runtime_env: Optional[Dict[str,Any]] = None):
+        self.funcs_ir = funcs_ir
+        self.env = runtime_env or {}
+    def run(self, key: str, args: List[Any]=None):
+        args = args or []
+        if key not in self.funcs_ir: raise RuntimeError(f"No function {key} compiled to IR")
+        return self.run_ir(self.funcs_ir[key], args)
+    def run_ir(self, instrs: List[IRInstr], args: List[Any]):
+        # simple stackless SSA-like interpreter: map temps to values and symbol table for locals
+        vals: Dict[str,Any] = {}
+        locals_tab: Dict[str,Any] = {}
+        # apply args to parameter names? Not stored in IR; caller must use globals or STORE before RET
+        for instr in instrs:
+            if instr.op == IROp.CONST:
+                vals[instr.dst] = instr.args[0]
+            elif instr.op == IROp.LOAD:
+                name = instr.args[0]
+                vals[instr.dst] = locals_tab.get(name, self.env.get(name))
+            elif instr.op == IROp.STORE:
+                name, src = instr.args
+                locals_tab[name] = vals.get(src, src)
+            elif instr.op == IROp.ADD:
+                a,b = instr.args; vals[instr.dst] = self._get(a,vals) + self._get(b,vals)
+            elif instr.op == IROp.SUB:
+                a,b = instr.args; vals[instr.dst] = self._get(a,vals) - self._get(b,vals)
+            elif instr.op == IROp.MUL:
+                a,b = instr.args; vals[instr.dst] = self._get(a,vals) * self._get(b,vals)
+            elif instr.op == IROp.DIV:
+                a,b = instr.args; vb = self._get(b,vals); vals[instr.dst] = (0 if vb==0 else self._get(a,vals)/vb)
+            elif instr.op == IROp.CALL:
+                funcname, argtemps = instr.args
+                argvals = tuple(self._get(a,vals) for a in argtemps)
+                if funcname == "print":
+                    print(*argvals); vals[instr.dst] = None
+                else:
+                    # call user function if compiled
+                    if funcname and funcname in self.funcs_ir:
+                        vals[instr.dst] = self.run(funcname, list(argvals))
+                    else:
+                        vals[instr.dst] = None
+            elif instr.op == IROp.RET:
+                if instr.args[0] is None: return None
+                return self._get(instr.args[0], vals)
+            elif instr.op == IROp.LIST:
+                items = instr.args[0]
+                vals[instr.dst] = [self._get(i,vals) for i in items]
+            elif instr.op == IROp.INDEX:
+                base_t, idx_t = instr.args; base = self._get(base_t,vals); idx = self._get(idx_t,vals)
+                if isinstance(base, list):
+                    if not isinstance(idx,int): raise RuntimeError("Index must be int")
+                    vals[instr.dst] = base[idx]
+                elif isinstance(base, dict):
+                    vals[instr.dst] = base.get(idx)
+                else:
+                    vals[instr.dst] = None
+        return None
+    def _get(self, key, vals):
+        if isinstance(key, str) and key.startswith('%t'): return vals.get(key)
+        return key
+
+# -------------------------
+# ProCompiler facade
+# -------------------------
+class ProCompiler:
+    @staticmethod
+    def pro_compile_and_run(source: str, entry: str="main/0"):
+        parser = ProParser(source)
+        prog = parser.parse()
+        # semantic analysis
+        tc = TypeChecker(prog)
+        try:
+            tc.check()
+        except SemanticError as e:
+            print("[TYPE ERROR]", e); raise
+        # lower to IR
+        irb = IRBuilder()
+        funcs_ir = irb.lower_program(prog)
+        # create execution engine and run
+        ee = ExecutionEngine(funcs_ir)
+        return ee.run(entry, [])
+
+# Minimal example: if you want to use this pipeline:
+# result = ProCompiler.pro_compile_and_run('func main() { print(1+2); }')
+
 TOKENS = [
     ("NUMBER", r"-?\d+(\.\d+)?"),
     ("ID", r"[A-Za-z_][A-Za-z0-9_]*"),
@@ -1208,13 +1762,11 @@ import argparse
 import threading
 import socket
 import json
-from typing import List, Dict, Any, Optional, Union
+from typing import List, Dict, Any
 from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict
-from io import BytesIO
-from enum import Enum, auto
-from dataclasses import dataclass, field
-from copy import deepcopy
+from enum import Enum
+from dataclasses import dataclass
 # -------------------------
 # Lexer
 TokenType = Enum('TokenType', [
@@ -1262,7 +1814,7 @@ class Token:
 # Appended: finish FastVM slow-path + call_interpreted; add simple object emitter & linker and extended FFI/syscall mapping.
 # These definitions augment existing classes in this file.
 
-import json, os, io, re
+import json, re
 
 # ---- FastVM: implement call_interpreted and slow fallback by delegating to MiniRuntime ----
 def fastvm_call_interpreted(self, cname, args):
