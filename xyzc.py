@@ -3176,3 +3176,236 @@ for fn in ast.funcs:
 
                 for k,v in symtab.items():
                     hot_registry.register(k, v)
+
+#!/usr/bin/env python3
+# xyzc.py — XYZ Bootstrap Compiler
+# SIMD + CUDA + OpenCL + Auto-Kernel Generation
+import sys, numpy as np
+import pycuda.driver as cuda, pycuda.autoinit, pycuda.compiler
+import pyopencl as cl
+
+# ----------------------------
+# AST NODES
+# ----------------------------
+class ASTNode:
+    def __init__(self, kind, name=None, value=None, children=None):
+        self.kind = kind
+        self.name = name
+        self.value = value
+        self.children = children if children else []
+    def __repr__(self): return f"<{self.kind}:{self.name or self.value}>"
+
+# ----------------------------
+# LEXER
+# ----------------------------
+class Lexer:
+    def __init__(self, src): self.src = src
+    def tokenize(self):
+        tokens, cur = [], ""
+        for ch in self.src:
+            if ch.isspace():
+                if cur: tokens.append(cur); cur = ""
+            elif ch in "()[]{},":
+                if cur: tokens.append(cur); cur = ""
+                tokens.append(ch)
+            else: cur += ch
+        if cur: tokens.append(cur)
+        return tokens
+
+# ----------------------------
+# PARSER
+# ----------------------------
+class Parser:
+    def __init__(self, tokens): self.tokens = tokens; self.pos = 0
+    def peek(self): return self.tokens[self.pos] if self.pos < len(self.tokens) else None
+    def consume(self): tok = self.peek(); self.pos += 1; return tok
+
+    def parse(self):
+        nodes = []
+        while self.peek():
+            if self.peek() == "Item": nodes.append(self.parse_item())
+            elif self.peek() == "run": nodes.append(self.parse_run())
+            else: self.consume()
+        return ASTNode("Program", children=nodes)
+
+    def parse_item(self):
+        self.consume()  # Item
+        name = self.consume(); self.consume(); self.consume()  # ( )
+        body = []
+        while self.peek() and self.peek() not in ["Item", "run"]:
+            tok = self.consume()
+            if tok == "let":
+                var = self.consume(); self.consume(); val = self.consume()
+                body.append(ASTNode("Let", name=var, value=val))
+            elif tok == "trait":
+                tname = self.consume(); self.consume(); val = self.consume(); self.consume()
+                body.append(ASTNode("Trait", name=tname, value=val))
+            elif tok == "apply":
+                target = self.consume(); self.consume(); args=[]
+                while self.peek() != ")": args.append(self.consume())
+                self.consume(); body.append(ASTNode("Apply", name=target, value=args))
+            elif tok == "dispatch":
+                target = self.consume(); self.consume(); args=[]
+                while self.peek() != ")": args.append(self.consume())
+                self.consume(); body.append(ASTNode("Dispatch", name=target, value=args))
+            elif tok == "for":
+                self.consume(); target=self.consume(); self.consume(); action=self.consume()
+                body.append(ASTNode("ForEach", name=target, value=action))
+        return ASTNode("Item", name=name, children=body)
+
+    def parse_run(self):
+        self.consume(); target = self.consume(); self.consume(); self.consume()
+        return ASTNode("Run", name=target)
+
+# ----------------------------
+# OPTIMIZER (FLOP Counting)
+# ----------------------------
+class Optimizer:
+    def __init__(self): self.flops = 0
+    def optimize(self, ast):
+        ast = self.constant_fold(ast); ast = self.loop_unroll(ast); ast = self.peephole(ast)
+        print(f"[Optimizer] Estimated FLOPs: {self.flops}")
+        return ast
+    def constant_fold(self, ast):
+        for node in ast.children:
+            if node.kind == "Item":
+                for c in node.children:
+                    if c.kind == "Apply" and c.name == "Force":
+                        self.flops += 2  # mul + add
+        return ast
+    def loop_unroll(self, ast): return ast
+    def peephole(self, ast): return ast
+
+# ----------------------------
+# GPU DISPATCHER (CUDA + OpenCL)
+# ----------------------------
+class GPUDispatcher:
+    def __init__(self): self.cuda_module=None; self.cl_context=None; self.cl_queue=None; self.cl_program=None
+    def load_cuda(self, ptx="force.auto.ptx"):
+        with open(ptx, "r") as f: src=f.read()
+        self.cuda_module = pycuda.compiler.SourceModule(src)
+        print("[GPU] CUDA PTX loaded")
+    def load_opencl(self, cl_file="force.auto.cl"):
+        ctx=cl.create_some_context(); queue=cl.CommandQueue(ctx)
+        src=open(cl_file).read(); prog=cl.Program(ctx, src).build()
+        self.cl_context, self.cl_queue, self.cl_program = ctx, queue, prog
+        print("[GPU] OpenCL kernel built")
+    def launch_cuda(self,pos,vel,g):
+        n=len(pos); pos_gpu=cuda.mem_alloc(pos.nbytes); vel_gpu=cuda.mem_alloc(vel.nbytes)
+        cuda.memcpy_htod(pos_gpu,pos); cuda.memcpy_htod(vel_gpu,vel)
+        func=self.cuda_module.get_function("apply_force"); threads=256; blocks=(n+threads-1)//threads
+        func(pos_gpu,vel_gpu,np.float32(g),np.int32(n),block=(threads,1,1),grid=(blocks,1))
+        cuda.memcpy_dtoh(pos,pos_gpu); cuda.memcpy_dtoh(vel,vel_gpu); return pos,vel
+    def launch_opencl(self,pos,vel,g):
+        n=len(pos); mf=cl.mem_flags; ctx=self.cl_context; queue=self.cl_queue
+        pos_buf=cl.Buffer(ctx,mf.READ_WRITE|mf.COPY_HOST_PTR,hostbuf=pos)
+        vel_buf=cl.Buffer(ctx,mf.READ_WRITE|mf.COPY_HOST_PTR,hostbuf=vel)
+        self.cl_program.apply_force(queue,(n,),None,pos_buf,vel_buf,np.float32(g),np.int32(n))
+        cl.enqueue_copy(queue,pos,pos_buf).wait(); cl.enqueue_copy(queue,vel,vel_buf).wait()
+        return pos,vel
+
+# ----------------------------
+# NASM SIMD ROUTINES (CPU Fallback)
+# ----------------------------
+def nasm_simd_routines():
+    return """
+; SSE Vector Add
+vec_add:
+    movaps xmm0, [rdi]
+    movaps xmm1, [rsi]
+    addps xmm0, xmm1
+    movaps [rdx], xmm0
+    ret
+
+; AVX2 Vector Add
+vec_add_avx2:
+    vmovaps ymm0, [rdi]
+    vmovaps ymm1, [rsi]
+    vaddps ymm0, ymm0, ymm1
+    vmovaps [rdx], ymm0
+    ret
+
+; AVX-512 Vector Add
+vec_add_avx512:
+    vmovaps zmm0, [rdi]
+    vmovaps zmm1, [rsi]
+    vaddps zmm0, zmm0, zmm1
+    vmovaps [rdx], zmm0
+    ret
+
+; Dot Product (SSE)
+vec_dot:
+    movaps xmm0, [rdi]
+    movaps xmm1, [rsi]
+    mulps xmm0, xmm1
+    haddps xmm0, xmm0
+    haddps xmm0, xmm0
+    movss [rdx], xmm0
+    ret
+
+; Gravity Step (pos += vel)
+gravity_step:
+    movaps xmm0, [pos]
+    movaps xmm1, [vel]
+    addps xmm0, xmm1
+    movaps [pos], xmm0
+    ret
+"""
+
+# ----------------------------
+# CODEGEN (Auto-generate GPU Kernels)
+# ----------------------------
+class CodeGen:
+    def __init__(self): self.lines=[]
+    def gen(self,ast):
+        for child in ast.children:
+            if child.kind=="Item": self.gen_item(child)
+        return "\n".join(self.lines)
+    def gen_item(self,node):
+        for b in node.children:
+            if b.kind=="Apply" and b.name=="Force":
+                # ---- Generate OpenCL kernel
+                with open("force.auto.cl","w") as f:
+                    f.write("__kernel void apply_force(__global float*pos,__global float*vel,float g,int n){\n")
+                    f.write(" int i=get_global_id(0);\n if(i<n){ vel[i]+=g; pos[i]+=vel[i]; }}\n")
+                print("[CodeGen] Auto-generated OpenCL kernel: force.auto.cl")
+
+                # ---- Generate CUDA kernel
+                with open("force.auto.cu","w") as f:
+                    f.write("__global__ void apply_force(float *pos,float *vel,float g,int n){\n")
+                    f.write(" int i=blockIdx.x*blockDim.x+threadIdx.x;\n")
+                    f.write(" if(i<n){ vel[i]+=g; pos[i]+=vel[i]; }}\n")
+                print("[CodeGen] Auto-generated CUDA kernel: force.auto.cu")
+                print(">> Compile CUDA kernel with: nvcc -ptx force.auto.cu -o force.auto.ptx")
+
+# ----------------------------
+# COMPILER DRIVER
+# ----------------------------
+def main():
+    if len(sys.argv)<2:
+        print("Usage: xyzc.py file.xyz"); sys.exit(1)
+    src=open(sys.argv[1]).read()
+    lexer=Lexer(src); parser=Parser(lexer.tokenize()); ast=parser.parse()
+    opt=Optimizer(); ast=opt.optimize(ast)
+    cg=CodeGen(); cg.gen(ast)
+
+    # Example simulation data
+    n=1024; pos=np.zeros(n,dtype=np.float32); vel=np.zeros(n,dtype=np.float32); g=9.8
+    gpu=GPUDispatcher()
+
+    try:
+        gpu.load_cuda("force.auto.ptx"); pos,vel=gpu.launch_cuda(pos,vel,g)
+        print("[CUDA] pos[0:5]=",pos[:5])
+    except Exception as e: print("[CUDA unavailable]",e)
+
+    try:
+        gpu.load_opencl("force.auto.cl"); pos,vel=gpu.launch_opencl(pos,vel,g)
+        print("[OpenCL] pos[0:5]=",pos[:5])
+    except Exception as e: print("[OpenCL unavailable]",e)
+
+    # CPU SIMD fallback (NASM file)
+    with open("simd.asm","w") as f: f.write(nasm_simd_routines())
+    print("[CPU SIMD] NASM fallback written to simd.asm")
+
+if __name__=="__main__": main()
+
