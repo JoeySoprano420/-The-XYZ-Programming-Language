@@ -467,3 +467,53 @@ If XYZ_GRAND_STRICT=1 and all fail, it raises a GrandResolutionError with diagno
 
 ## _____
 
+✅ Correct Usage Examples
+Run a program directly:
+
+bash
+python xyzc.py hello.xyz --run
+Emit NASM assembly:
+
+bash
+python xyzc.py hello.xyz --emit-asm -o hello.asm
+Emit object file:
+
+bash
+python xyzc.py hello.xyz --emit-obj -o hello.obj
+Link multiple object files:
+
+bash
+python xyzc.py foo.obj bar.obj --link -o final.asm
+Enable Mega features (structs, list_add, etc.):
+
+bash
+python xyzc.py vectors.xyz --run --mega
+🧠 Why It Matters
+The source argument is required because xyzc needs at least one .xyz file to parse, compile, or run. Without it, the compiler doesn’t know what ceremony to perform.
+
+If you’re testing, you can start with a minimal file like:
+
+xyz
+func main() {
+  print(42)
+  return 0
+}
+Save that as hello.xyz and try one of the commands above.
+
+🧪 Example .xyz
+func main() {
+    msg = "Hello, world!"
+    print(msg)
+    print(1234)
+    return 0
+}
+
+Output after compiling + running:
+Hello, world!
+1234
+
+
+✅ Now print supports both strings and integers.
+
+## _____
+
