@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-XYZC6.py - XYZ Programming Language Compiler Toolchain
+XYZC5.py - XYZ Programming Language Compiler Toolchain
 -------------------------------------------------------
 Includes:
   - Lexer & Parser → AST
@@ -11,7 +11,7 @@ Includes:
   - FastRuntime (Bytecode + VM)
   - HotSwap & Mega Features
 
-New in C6:
+New in C5:
   ✅ Real variable storage in NASM
   ✅ print_num + print_str syscalls
   ✅ Mixed arguments in print
@@ -300,7 +300,7 @@ class Codegen:
 # ---------------------------------------------------------------------------
 def main():
     if len(sys.argv)<2:
-        print("Usage: xyzc6.py file.xyz [--emit-asm]")
+        print("Usage: xyzc5.py file.xyz [--emit-asm]")
         sys.exit(1)
     path=sys.argv[1]
     src=open(path).read()
