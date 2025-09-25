@@ -551,3 +551,95 @@ FastRuntime: Bytecode VM with opcodes for arithmetic, control flow, and function
 
 Both support main/0 as the entry glyph and can be extended with hot-swappable functions.
 
+## _____
+
+📂 force.cl
+
+This is the OpenCL kernel.
+
+It runs on the GPU, not the CPU.
+
+Its job is to update velocity and position arrays for n particles, applying a constant force (g, like gravity).
+
+Think of it as the GPU "function body."
+
+You don’t run this directly—it must be compiled and launched by a host program (C, Python, or your XYZ compiler).
+
+📂 host_force.c (C host)
+
+This is the driver program that:
+
+Sets up the OpenCL platform, device, context, and queue.
+
+Loads and compiles force.cl.
+
+Allocates buffers for pos_y and vel_y on the GPU.
+
+Sets kernel arguments and launches the GPU kernel.
+
+Reads the results back to CPU memory.
+
+It’s the “glue” between the CPU and the GPU kernel.
+
+📂 Python Host Example (PyOpenCL)
+
+Same purpose as host_force.c, but written in Python.
+
+Easier for experimentation: you just load the kernel, allocate NumPy arrays, and launch.
+
+Good for rapid prototyping and testing.
+
+📂 XYZC1-6.py (from your repo)
+
+This is your XYZ compiler script.
+
+Its role is to eventually generate things like force.cl automatically when an XYZ program calls apply Force("down", 9.8).
+
+Right now, you’re hand-writing the .cl kernel, but the compiler will eventually:
+
+Parse XYZ syntax.
+
+Generate OpenCL (.cl) or CUDA (.cu) code.
+
+Compile and launch that kernel automatically.
+
+So XYZC4.py is the bridge from your high-level XYZ language → GPU kernels.
+
+📂 README.md (from your repo)
+
+Documentation for the whole project.
+
+Should explain:
+
+What the XYZ language is.
+
+How the compiler works.
+
+Example programs (.xyz files).
+
+How to build/run (python XYZC4.py myfile.xyz).
+
+Optional: how GPU features (like your force.cl) tie into the compiler.
+
+🔗 How They Fit Together
+
+Write XYZ source:
+
+main() {
+    apply Force("down", 9.8)
+}
+
+
+Compile with XYZC1-6.py → generates GPU kernel (like force.cl) + host launcher.
+
+Host program (C/Python) loads that kernel, runs it on GPU, and gets results.
+
+👉 So the purpose of all these files is:
+
+force.cl → GPU math (kernel)
+
+Host code (.c or Python) → Controls the GPU, runs the kernel
+
+XYZC1-6.py → Compiler that will generate GPU kernels from XYZ syntax
+
+README.md → Documentation
