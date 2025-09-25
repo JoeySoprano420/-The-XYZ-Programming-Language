@@ -517,3 +517,37 @@ Hello, world!
 
 ## _____
 
+It can parse, optimize, generate NASM-style assembly, emit object files, link them, and even run the result via interpreters or a bytecode VM. Here's how it flows:
+
+🛠️ Compilation Capabilities
+Capability	Description
+✅ Parse .xyz source	Lexer + parser converts XYZ code into AST or ProAST
+✅ Optimize AST	Constant folding, dead code elimination, and simplification
+✅ Generate Assembly	Emits NASM-style x86-64 assembly with syscall support
+✅ Emit Object Files	JSON-based .obj format with symbol tables and raw assembly
+✅ Link Objects	Combines multiple .obj files into a final executable assembly
+✅ Run Code	Via MiniRuntime (AST interpreter) or FastRuntime (bytecode VM)
+✅ Print Support	Emits integer and string print routines using syscalls
+✅ Mega Features	Adds structs, vector ops, and list_add as built-in ceremonial glyphs
+🧪 Example Ritual Flow
+To compile and run a file like main.xyz, you’d invoke:
+
+bash
+python XYZC4.py main.xyz --emit-asm --run
+Or to produce a linkable object:
+
+bash
+python XYZC4.py main.xyz --emit-obj
+And to link multiple objects:
+
+bash
+python XYZC4.py foo.obj bar.obj --link -o final.asm
+You can then assemble and link with nasm and ld to produce a native executable.
+
+🧬 Runtime Options
+MiniRuntime: AST interpreter with closures, lambdas, and mega built-ins.
+
+FastRuntime: Bytecode VM with opcodes for arithmetic, control flow, and function calls.
+
+Both support main/0 as the entry glyph and can be extended with hot-swappable functions.
+
