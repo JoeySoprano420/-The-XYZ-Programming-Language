@@ -1558,3 +1558,40 @@ def gen_print_funcs(self):
     self.emit("  syscall")
     self.epilogue()
 
+if isinstance(n, Call) and n.name == "print":
+    for a in n.args:
+        self.gen_stmt(a)
+        if isinstance(a, StrLiteral):
+            self.emit("  call print_str")
+        else:
+            self.emit("  call print_num")
+    self._needs_print = True
+    
+
+if isinstance(n, Call) and n.name == "print":
+    for a in n.args:
+        self.gen_stmt(a)
+        if isinstance(a, StrLiteral):
+            self.emit("  call print_str")
+        elif isinstance(a, Number):
+            self.emit("  call print_num")
+        else:
+            # assume numeric result ends in rax
+            self.emit("  call print_num")
+    self._needs_print = True
+    
+
+if isinstance(n, Call) and n.name == "print":
+    argc = len(n.args)
+    for i,a in enumerate(n.args):
+        self.gen_stmt(a)
+        if isinstance(a, StrLiteral):
+            self.emit("  call print_str")
+        else:
+            self.emit("  call print_num")
+        if i < argc - 1:
+            lbl = self.add_string(" ")
+            self.emit(f"  lea rax, [{lbl}]")
+            self.emit("  call print_str")
+    self._needs_print = True
+
