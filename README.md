@@ -1,4 +1,4 @@
-# 🌌 The XYZ Programming Language (XYZC4.PY)
+# 🌌 The XYZ Programming Language 
 
 *"Item-Oriented. Hex-Bodied. Self-Optimized."*
 
