@@ -454,7 +454,7 @@ Serializes symbols into JSON object files and links them into a unified .text se
 
 Like binding scrolls into a single ceremonial tome.
 
-🔮 Grand Resolution
+💡⚡️ Grand Resolution
 The XYZ_GRAND_EXECUTE=1 mode attempts all pipelines in order:
 
 ProCompiler
