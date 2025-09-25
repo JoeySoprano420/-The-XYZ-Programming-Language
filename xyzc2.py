@@ -31,6 +31,8 @@
 
 import copy, hashlib, inspect, decimal, numbers
 from decimal import Decimal
+from platform import java_ver, node
+from tkinter import N
 from typing import Callable
 
 # --- Type registry ---
@@ -4425,7 +4427,6 @@ Notes:
 - Exit code is always 0 by design (tolerant execution). Remove that behavior
   if you need real failure propagation.
 """
-from __future__ import annotations
 import argparse
 import json
 import os
@@ -4964,8 +4965,8 @@ if os.environ.get("ENABLE_MEGA_FULL", "0") == "1" or "--enable-mega-full" in sys
 # Replace Lambda handling:
     if isinstance(node, Lambda):
     # capture reference to frames so closure observes subsequent mutations of outer frames
-        (func: return Closure(node.params, node.body, self.frames)
-
+        njit:Any (node.params, node.body, self.frames) # type: ignore
+           # for type checker)
 # Replace closure call handling (inside Call handling where closure candidate is found):
 for f in reversed(self.frames):
     if node.name in f:
@@ -5183,7 +5184,7 @@ class UnaryOp(ASTNode):
 
 # In the lightweight Parser.parse_unary: replace unary minus handling:
 if tok.kind=="OP" and tok.val=="-":
-    self.eat("OP"); return UnaryOp("-", self.parse_unary())
+    self.eat("OP"); UnaryOp("-", self.parse_unary())
 
 # And in ProParser.nud (Pratt-based) adjust: when encountering '-' in nud or unary path,
 # ensure it produces a UnaryOp rather than a BinOp multiplied by -1.
@@ -5198,7 +5199,7 @@ class PUnary(PNode):
 if kind == 'OP' and val == '-':
     # unary minus
     expr = self.parse_expr(100)
-    return PUnary('-', expr)
+    PUnary('-', expr)
 
 # Make sure IRBuilder and other lowering handle Unary/PUnary by lowering to CONST -1 * expr or direct negation.
 # IRBuilder.lower_expr should handle PUnary / UnaryOp accordingly (negation).
@@ -5297,13 +5298,7 @@ def write_wrapper(target_script: str, wrapper_path: str) -> str:
 
 def write_wrapper(target_script: str, wrapper_path: str = WRAPPER_NAME_DEFAULT) -> str:
     """
-    Create a small wrapper script that runs `target_script` in a guarded way:
-    - captures stdout/stderr to files
-    - records exceptions to ERRORS_JSON
-    - always exits with code 0 (tolerant runner)
-    Returns path to the created wrapper file.
-    """
-    wrapper_code = f'''# Auto-generated wrapper to run {os.path.basename(target_script)} with suppression
+wrapper_code = f'''# Auto-generated wrapper to run {os.path.basename(target_script)} with suppression
 import runpy, sys, warnings, json, traceback, time, os
 warnings.filterwarnings("ignore")
 
@@ -5356,46 +5351,46 @@ except Exception:
 sys.exit(0)
 '''
     # Write wrapper file
-    with open(wrapper_path, "w", encoding="utf-8") as f:
+with open(wrapper_path, "w", encoding="utf-8") as f:
         f.write(wrapper_code)
-    try:
+try:
         st = os.stat(wrapper_path)
         os.chmod(wrapper_path, st.st_mode | 0o100)  # make executable for owner where supported
-    except Exception:
+except Exception:
         pass
-    return wrapper_path
+wrapper_path # type: ignore
 
-    def parse_args():
-    parser = argparse.ArgumentParser(description="Run target script in isolated venv with logging")
-    parser.add_argument("target", help="Path to target script to run")
-    parser.add_argument("--venv", default=VENV_DIR_DEFAULT, help="Path to create/use venv (default: .xyz_venv)")
-    parser.add_argument("--clear", action="store_true", help="Clear existing venv before creating")
-    parser.add_argument("--keep-venv", action="store_true", help="Keep venv after execution (default: remove)")
-    parser.add_argument("--packages", nargs="*", default=[], help="Additional packages to install in venv")
-    parser.add_argument("--timeout", type=int, default=60, help="Timeout in seconds for target script (default: 60s)")
-    parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
-    parser.add_argument("--grand-execute", action="store_true", help="Enable grand resolution and execution mode")
-    return parser.parse_args()
-    def main_cli():
-    args = parse_args()
-    if not os.path.isfile(args.target):
+def parse_args():
+        parser = argparse.ArgumentParser(description="Run target script in isolated venv with logging")
+parser.add_argument("target", help="Path to target script to run")
+parser.add_argument("--venv", default=VENV_DIR_DEFAULT, help="Path to create/use venv (default: .xyz_venv)")
+parser.add_argument("--clear", action="store_true", help="Clear existing venv before creating")
+parser.add_argument("--keep-venv", action="store_true", help="Keep venv after execution (default: remove)")
+parser.add_argument("--packages", nargs="*", default=[], help="Additional packages to install in venv")
+parser.add_argument("--timeout", type=int, default=60, help="Timeout in seconds for target script (default: 60s)")
+parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
+parser.add_argument("--grand-execute", action="store_true", help="Enable grand resolution and execution mode")
+parser.parse_args()
+def main_cli():
+        args = parse_args()
+if not os.path.isfile(args.target):
         print(f"Error: target script {args.target} not found", file=sys.stderr)
         sys.exit(1)
         venv_path = os.path.abspath(args.venv)
         if args.clear and os.path.isdir(venv_path):
-        print(f"[MAIN] Clearing existing venv at {venv_path}")
+            print(f"[MAIN] Clearing existing venv at {venv_path}")
         shutil.rmtree(venv_path)
         if not os.path.isdir(venv_path):
-        print(f"[MAIN] Creating venv at {venv_path}")
+                print(f"[MAIN] Creating venv at {venv_path}")
         venv.EnvBuilder(with_pip=True).create(venv_path)
-        else:
+        
         print(f"[MAIN] Using existing venv at {venv_path}")
         python_exe = os.path.join(venv_path, "Scripts" if platform.system()=="Windows" else "bin", "python")
         if not os.path.isfile(python_exe):
             print(f"Error: python executable not found in venv at {python_exe}", file=sys.stderr)
             sys.exit(1)
             if args.packages:
-            print(f"[MAIN] Installing packages in venv: {args.packages}")
+                    print(f"[MAIN] Installing packages in venv: {args.packages}")
             subprocess.check_call([python_exe, "-m", "pip", "install", "--upgrade", "pip"])
             subprocess.check_call([python_exe, "-m", "pip", "install"] + args.packages)
             wrapper_path = write_wrapper(args.target)
@@ -5414,7 +5409,7 @@ sys.exit(0)
                     print("[MAIN] Process did not terminate; killing")
                     proc.kill()
                     retcode = proc.returncode
-                    else:
+                   
                     retcode = proc.returncode
                     print(f"[MAIN] Process exited with code {retcode}")
                     if not args.keep_venv:
@@ -5422,14 +5417,14 @@ sys.exit(0)
                         shutil.rmtree(venv_path)
                         if os.path.isfile(ERRORS_JSON):
                             print(f"[MAIN] Errors recorded in {ERRORS_JSON}:")
-                            try:
-                                with open(ERRORS_JSON, "r", encoding="utf-8") as f:
+                            
+with open(ERRORS_JSON, "r", encoding="utf-8") as f:
                                     errors = json.load(f)
                                     for err in errors:
                                         print(f" - {err.get('type')}: {err.get('msg')}")
                                         if args.verbose and 'trace' in err:
                                             print(err['trace'])
-                                            except Exception as e:
+                                            Exception
                                             print(f" - (failed to read errors: {e})")
 
                                             #!/usr/bin/env python3
@@ -6862,874 +6857,4 @@ def merge_symbol_tables(main_symtab: Dict[str, FuncDef], extra_symtab: Dict[str,
 # Interpreter: closures, frames, locals, stack-frame emulation
 # -------------------------
 class Closure:
-    """
-    Closure that captures a reference to the runtime frames list so that
-    the closure sees later mutations of outer frames.
-    """
-    def __init__(self, params, body, env_frames):
-        self.params = params
-        self.body = body
-        # env_frames is expected to be the runtime's frames list (reference, not a copy)
-        self.env_frames = env_frames  # type: List[Dict[str, Any]]
-
-class MiniRuntime:
-    def __init__(self, symtab: Dict[str, FuncDef], hot_registry: HotSwapRegistry):
-        self.symtab = symtab
-        self.hot = hot_registry
-        self.memory = {}
-        self._next_addr = 1
-        self.mutexes = {}
-        self.lock = threading.Lock()
-        # frame stack: list of dicts (locals)
-        self.frames: List[Dict[str, object]] = []
-
-    def alloc(self, size: int):
-        with self.lock:
-            addr = self._next_addr; self._next_addr += 1
-            self.memory[addr] = bytearray(size)
-        print(f"[RUNTIME] alloc -> addr={addr} size={size}")
-        return addr
-
-    def free(self, addr: int):
-        with self.lock:
-            if addr in self.memory:
-                del self.memory[addr]
-                print(f"[RUNTIME] free -> addr={addr}")
-                return True
-            print(f"[RUNTIME] free -> addr not found: {addr}")
-            return False
-
-    def mutex(self):
-        with self.lock:
-            mid = len(self.mutexes) + 1
-            self.mutexes[mid] = threading.Lock()
-        print(f"[RUNTIME] mutex -> id={mid}")
-        return mid
-
-    def mutex_lock(self, mid: int):
-        m = self.mutexes.get(mid)
-        if m:
-            m.acquire()
-            print(f"[RUNTIME] mutex_lock -> {mid}")
-            return True
-        return False
-
-    def mutex_unlock(self, mid: int):
-        m = self.mutexes.get(mid)
-        if m:
-            m.release()
-            print(f"[RUNTIME] mutex_unlock -> {mid}")
-            return True
-        return False
-
-    def push_frame(self, locals_map=None):
-        self.frames.append(locals_map or {})
-    def pop_frame(self):
-        if self.frames: self.frames.pop()
-    def current_frame(self):
-        return self.frames[-1] if self.frames else {}
-
-    def run_func(self, key: str, args: List):
-        func = self.hot.get(key) or self.symtab.get(key)
-        if not func:
-            raise Exception(f"Function {key} not found")
-        # bind params
-        frame = {}
-        for i, pname in enumerate(func.params):
-            frame[pname] = args[i] if i < len(args) else None
-        self.push_frame(frame)
-        result = None
-        for stmt in func.body:
-            result = self.eval(stmt, frame, call_stack=[])
-            # early return handling via Return nodes yields value
-            if isinstance(stmt, Return):
-                break
-        self.pop_frame()
-        return result
-
-    def eval(self, node):
-        if node is None: return None
-        if isinstance(node, Number): return node.val
-        if isinstance(node, Bool): return 1 if node.val else 0
-        if isinstance(node, Var):
-            # look up in frames (top-down), then env of closures if present
-            for f in reversed(self.frames):
-                if node.name in f: return f[node.name]
-            return None
-        if isinstance(node, Assign):
-            val = self.eval(node.expr)
-            # assign into current frame
-            self.current_frame()[node.name] = val
-            return val
-        if isinstance(node, Return): return self.eval(node.expr)
-        if isinstance(node, BinOp):
-            l = self.eval(node.left); r = self.eval(node.right)
-            if node.op == "+": return (l or 0) + (r or 0)
-            if node.op == "-": return (l or 0) - (r or 0)
-            if node.op == "*": return (l or 0) * (r or 0)
-            if node.op == "/": return 0 if (r or 0) == 0 else (l or 0) / r
-            if node.op == "==": return 1 if l == r else 0
-            if node.op == "!=": return 1 if l != r else 0
-            if node.op == "<": return 1 if l < r else 0
-            if node.op == ">": return 1 if l > r else 0
-            return None
-        if isinstance(node, Call):
-            # builtins first
-            if isinstance(node.target, str):
-                name = node.target
-                if name == "print":
-                    vals = [self.eval(a) for a in node.args]
-                    print(*vals)
-                    return None
-                if name == "alloc":
-                    size = int(self.eval(node.args[0])) if node.args else 0
-                    return self.alloc(size)
-            # user functions by key
-            if isinstance(node.target, str) and node.target in self.funcs:
-                fn = self.funcs[node.target]
-                argvals = [self.eval(a) for a in node.args]
-                return self.exec_func(fn, argvals, call_stack=[])
-            # call on expression result if target is expression
-            if not isinstance(node.target, str):
-                targ = self.eval(node.target)
-                if callable(targ):
-                    args = [self.eval(a) for a in node.args]
-                    return targ(*args)
-            raise Exception(f"Call target not found: {node.target}")
-        if isinstance(node, Parallel):
-            with ThreadPoolExecutor(max_workers=len(node.body) or 2) as ex:
-                futures = [ex.submit(self.eval, s) for s in node.body]
-                return [f.result() for f in futures]
-        if isinstance(node, TryCatch):
-            try:
-                for s in node.try_body: self.eval(s)
-            except Exception:
-                for s in node.catch_body: self.eval(s)
-            return None
-        return None
-
-# -------------------------
-# UCompiler Facade
-# -------------------------
-class UCompiler:
-    @staticmethod
-    def run_source(src: str, entry="main"):
-        toks = lex(src)
-        p = Parser(toks)
-        prog = p.parse_program()
-        # flatten nested statement-lists from blocks
-        def flatten(program: UProgram):
-            new_stmts=[]
-            for s in program.stmts:
-                if isinstance(s, list):
-                    new_stmts.extend(s)
-                else:
-                    new_stmts.append(s)
-            program.stmts = new_stmts
-            for fn in program.funcs:
-                nb=[]
-                for st in fn.body:
-                    if isinstance(st, list): nb.extend(st)
-                    else: nb.append(st)
-                fn.body = nb
-        flatten(prog)
-        # typecheck
-        TypeChecker(prog).check()
-        runtime = URuntime(prog)
-        return runtime.run(entry)
-
-# -------------------------
-# ADVANCED ENGINE: JIT, SSA optimizer, type inference, vectorization, profiler hooks
-# Opt-in via AdvancedEngine.activate(...) or environment XYZ_ADVANCED=1
-# -------------------------
-import threading
-import time
-from typing import Dict, Optional
-# Advanced Engine: JIT Compiler + Profiler + Optimizer
-
-# VS & Python compatibility runner (append to file)
-# - Silences warnings, installs a tolerant excepthook, and attempts multiple engines until one succeeds.
-# - When running inside an IDE/debugger (sys.gettrace) or when XYZ_IGNORE_ERRORS=1 or --ignore-errors
-#   it will ignore engine failures and continue; it can also force exit code 0 via XYZ_ALWAYS_EXIT_0=1.
-import warnings, sys, os, traceback, time
-
-def _install_compat_runner():
-    warnings.filterwarnings("ignore")
-
-    def _safe_excepthook(exc_type, exc, tb):
-        # Print error but don't abort IDE-hosted runs unless explicitly configured.
-        try:
-            print("[COMPAT] Uncaught exception:", exc_type.__name__, exc, file=sys.stderr)
-            traceback.print_exception(exc_type, exc, tb)
-        except Exception:
-            pass
-    sys.excepthook = _safe_excepthook
-
-    ide_debug = bool(sys.gettrace())
-    ide_env = any(k for k in os.environ.keys() if "VISUAL" in k.upper() or "VSCODE" in k.upper())
-    force_ignore = os.environ.get("XYZ_IGNORE_ERRORS", "0") == "1" or "--ignore-errors" in sys.argv
-
-    def _read_src():
-        # prefer CLI filename argument
-        if len(sys.argv) > 1 and os.path.isfile(sys.argv[1]):
-            return open(sys.argv[1], "r", encoding="utf-8").read()
-        # try known default main sources
-        for cand in ("main.xy", "main.xyz", "input.xy", "input.xyz"):
-            if os.path.isfile(cand):
-                return open(cand, "r", encoding="utf-8").read()
-        return ""
-
-    def try_engines(entry="main/0", src_text: str = None):
-        src_text = src_text or _read_src()
-        attempts = []
-        last_exc = None
-
-        # Ordered, best-effort attempts. Each may raise; we catch and continue when allowed.
-        engines = [
-            ("ProCompiler", lambda: ProCompiler.pro_compile_and_run(src_text, entry=entry)),
-            ("compile_and_run_xyz", lambda: compile_and_run_xyz(src_text, emit_obj=False, emit_asm=False, run=True)),
-            ("UCompiler", lambda: UCompiler.run_source(src_text, entry=entry.split("/")[0])),
-            ("grand_resolve", lambda: grand_resolve_and_execute()),
-            ("main()", lambda: (main() if callable(globals().get("main")) else None)),
-        ]
-
-        for name, fn in engines:
-            try:
-                print(f"[COMPAT] Trying engine: {name}")
-                res = fn()
-                print(f"[COMPAT] Engine {name} succeeded -> {res!r}")
-                return res
-            except Exception as e:
-                last_exc = e
-                # Always log full trace for diagnostics
-                print(f"[COMPAT] Engine {name} failed:")
-                traceback.print_exc()
-                # If running in IDE/debugger or force_ignore, continue trying other engines
-                if ide_debug or ide_env or force_ignore:
-                    print(f"[COMPAT] Ignoring failure of {name} due to IDE/force-ignore.")
-                    continue
-                # Otherwise re-raise to signal failure
-                raise
-
-        print("[COMPAT] All engines attempted; none succeeded." + (f" Last error: {last_exc}" if last_exc else ""))
-        return None
-
-    return ide_debug, ide_env, force_ignore, try_engines
-
-# Auto-run compatibility runner when executed directly.
-if __name__ == "__main__":
-    try:
-        ide_debug, ide_env, force_ignore, try_engines = _install_compat_runner()
-        # allow optional timeout via env var (seconds)
-        timeout = os.environ.get("XYZ_COMPAT_TIMEOUT")
-        if timeout:
-            try:
-                timeout = float(timeout)
-            except Exception:
-                timeout = None
-        if timeout:
-            start = time.time()
-            result = None
-            while True:
-                result = try_engines()
-                if result is not None: break
-                if (time.time() - start) >= timeout: break
-                time.sleep(0.5)
-        else:
-            try_engines()
-    except Exception as e:
-        # If not IDE and not forced-ignore, let exception propagate (so users see it).
-        if not (ide_debug or ide_env or force_ignore):
-            raise
-        print("[COMPAT] Suppressed exception during compatibility run:", e)
-    finally:
-        # If requested by environment, ensure exit code 0 to satisfy IDE/run configurations.
-        if os.environ.get("XYZ_ALWAYS_EXIT_0", "0") == "1" or ide_env or force_ignore:
-            try:
-                print("[COMPAT] Exiting with code 0 (IDE compatibility).")
-                sys.exit(0)
-            except SystemExit:
-                pass
-            # AdvancedEngine: JIT Compiler + Profiler + Optimizer
-            import threading
-            import time
-            from typing import Dict, Optional
-            # Advanced Engine: JIT Compiler + Profiler + Optimizer
-
-            # VS & Python compatibility runner (append to file)
-            # - Silences warnings, installs a tolerant excepthook, and attempts multiple engines until one succeeds.
-            # - When running inside an IDE/debugger (sys.gettrace) or when XYZ_IGNORE_ERRORS=1 or --ignore-errors
-            #   it will ignore engine failures and continue; it can also force exit code 0 via XYZ_ALWAYS_EXIT_0=1.
-            import warnings, sys, os, traceback, time
-
-            def _install_compat_runner():
-                warnings.filterwarnings("ignore")
-
-                def _safe_excepthook(exc_type, exc, tb):
-                    # Print error but don't abort IDE-hosted runs unless explicitly configured.
-                    try:
-                        print("[COMPAT] Uncaught exception:", exc_type.__name__, exc, file=sys.stderr)
-                        traceback.print_exception(exc_type, exc, tb)
-                    except Exception:
-                        pass
-                sys.excepthook = _safe_excepthook
-
-                ide_debug = bool(sys.gettrace())
-                ide_env = any(k for k in os.environ.keys() if "VISUAL" in k.upper() or "VSCODE" in k.upper())
-                force_ignore = os.environ.get("XYZ_IGNORE_ERRORS", "0") == "1" or "--ignore-errors" in sys.argv
-
-                def _read_src():
-                    # prefer CLI filename argument
-                    if len(sys.argv) > 1 and os.path.isfile(sys.argv[1]):
-                        return open(sys.argv[1], "r", encoding="utf-8").read()
-                    # try known default main sources
-                    for cand in ("main.xy", "main.xyz", "input.xy", "input.xyz"):
-                        if os.path.isfile(cand):
-                            return open(cand, "r", encoding="utf-8").read()
-                    return ""
-
-                def try_engines(entry="main/0", src_text: str = None):
-                    src_text = src_text or _read_src()
-                    attempts = []
-                    last_exc = None
-
-                    # Ordered, best-effort attempts. Each may raise; we catch and continue when allowed.
-                    engines = [
-                        ("ProCompiler", lambda: ProCompiler.pro_compile_and_run(src_text, entry=entry)),
-                        ("compile_and_run_xyz", lambda: compile_and_run_xyz(src_text, emit_obj=False, emit_asm=False, run=True)),
-                        ("UCompiler", lambda: UCompiler.run_source(src_text, entry=entry.split("/")[0])),
-                        ("grand_resolve", lambda: grand_resolve_and_execute()),
-                        ("main()", lambda: (main() if callable(globals().get("main")) else None)),
-                    ]
-
-                    for name, fn in engines:
-                        try:
-                            print(f"[COMPAT] Trying engine: {name}")
-                            res = fn()
-                            print(f"[COMPAT] Engine {name} succeeded -> {res!r}")
-                            return res
-                        except Exception as e:
-                            last_exc = e
-                            # Always log full trace for diagnostics
-                            print(f"[COMPAT] Engine {name} failed:")
-                            traceback.print_exc()
-                            # If running in IDE/debugger or force_ignore, continue trying other engines
-                            if ide_debug or ide_env or force_ignore:
-                                print(f"[COMPAT] Ignoring failure of {name} due to IDE/force-ignore.")
-                                continue
-                            # Otherwise re-raise to signal failure
-                            raise
-
-                    print("[COMPAT] All engines attempted; none succeeded." + (f" Last error: {last_exc}" if last_exc else ""))
-                    return None
-
-                return ide_debug, ide_env, force_ignore, try_engines
-
-            # Auto-run compatibility runner when executed directly.
-            if __name__ == "__main__":
-                try:
-                    ide_debug, ide_env, force_ignore, try_engines = _install_compat_runner()
-                    # allow optional timeout via env var (seconds)
-                    timeout = os.environ.get("XYZ_COMPAT_TIMEOUT")
-                    if timeout:
-                        try:
-                            timeout = float(timeout)
-                        except Exception:
-                            timeout = None
-                    if timeout:
-                        start = time.time()
-                        result = None
-                        while True:
-                            result = try_engines()
-                            if result is not None: break
-                            if (time.time() - start) >= timeout: break
-                            time.sleep(0.5)
-                    else:
-                        try_engines()
-                except Exception as e:
-                    # If not IDE and not forced-ignore, let exception propagate (so users see it).
-                    if not (ide_debug or ide_env or force_ignore):
-                        raise
-                    print("[COMPAT] Suppressed exception during compatibility run:", e)
-                finally:
-                    # If requested by environment, ensure exit code 0 to satisfy IDE/run configurations.
-                    if os.environ.get("XYZ_ALWAYS_EXIT_0", "0") == "1" or ide_env or force_ignore:
-                        try:
-                            print("[COMPAT] Exiting with code 0 (IDE compatibility).")
-                            sys.exit(0)
-                        except SystemExit:
-                            pass
-                        # AdvancedEngine: JIT Compiler + Profiler + Optimizer
-                        import threading
-                        import time
-                        from typing import Dict, Optional
-                        # Advanced Engine: JIT Compiler + Profiler + Optimizer
-
-                        # VS & Python compatibility runner (append to file)
-                        # - Silences warnings, installs a tolerant excepthook, and attempts multiple engines until one succeeds.
-                        # - When running inside an IDE/debugger (sys.gettrace) or when XYZ_IGNORE_ERRORS=1 or --ignore-errors
-                        #   it will ignore engine failures and continue; it can also force exit code 0 via XYZ_ALWAYS_EXIT_0=1.
-                        import warnings, sys, os, traceback, time
-
-                        def _install_compat_runner():
-                            warnings.filterwarnings("ignore")
-
-                            def _safe_excepthook(exc_type, exc, tb):
-                                # Print error but don't abort IDE-hosted runs unless explicitly configured.
-                                try:
-                                    print("[COMPAT] Uncaught exception:", exc_type.__name__, exc, file=sys.stderr)
-                                    traceback.print_exception(exc_type, exc, tb)
-                                except Exception:
-                                    pass
-                            sys.excepthook = _safe_excepthook
-
-                            ide_debug = bool(sys.gettrace())
-                            ide_env = any(k for k in os.environ.keys() if "VISUAL" in k.upper() or "VSCODE" in k.upper())
-                            force_ignore = os.environ.get("XYZ_IGNORE_ERRORS", "0") == "1" or "--ignore-errors" in sys.argv
-
-                            def _read_src():
-                                # prefer CLI filename argument
-                                if len(sys.argv) > 1 and os.path.isfile(sys.argv[1]):
-                                    return open(sys.argv[1], "r", encoding="utf-8").read()
-                                # try known default main sources
-                                for cand in ("main.xy", "main.xyz", "input.xy", "input.xyz"):
-                                    if os.path.isfile(cand):
-                                        return open(cand, "r", encoding="utf-8").read()
-                                return ""
-
-                            def try_engines(entry="main/0", src_text: str = None):
-                                src_text = src_text or _read_src()
-                                attempts = []
-                                last_exc = None
-
-                                # Ordered, best-effort attempts. Each may raise; we catch and continue when allowed.
-                                engines = [
-                                    ("ProCompiler", lambda: ProCompiler.pro_compile_and_run(src_text, entry=entry)),
-                                    ("compile_and_run_xyz", lambda: compile_and_run_xyz(src_text, emit_obj=False, emit_asm=False, run=True)),
-                                    ("UCompiler", lambda: UCompiler.run_source(src_text, entry=entry.split("/")[0])),
-                                    ("grand_resolve", lambda: grand_resolve_and_execute()),
-                                    ("main()", lambda: (main() if callable(globals().get("main")) else None)),
-                                ]
-
-                                for name, fn in engines:
-                                    try:
-                                        print(f"[COMPAT] Trying engine: {name}")
-                                        res = fn()
-                                        print(f"[COMPAT] Engine {name} succeeded -> {res!r}")
-                                        return res
-                                    except Exception as e:
-                                        last_exc = e
-                                        # Always log full trace for diagnostics
-                                        print(f"[COMPAT] Engine {name} failed:")
-                                        traceback.print_exc()
-                                        # If running in IDE/debugger or force_ignore, continue trying other engines
-                                        if ide_debug or ide_env or force_ignore:
-                                            print(f"[COMPAT] Ignoring failure of {name} due to IDE/force-ignore.")
-                                            continue
-                                        # Otherwise re-raise to signal failure
-                                        raise
-
-                                print("[COMPAT] All engines attempted; none succeeded." + (f" Last error: {last_exc}" if last_exc else ""))
-                                return None
-
-                            return ide_debug, ide_env, force_ignore, try_engines
-
-                        # Auto-run compatibility runner when executed directly.
-                        if __name__ == "__main__":
-                            try:
-                                ide_debug, ide_env, force_ignore, try_engines = _install_compat_runner()
-                                # allow optional timeout via env var (seconds)
-                                timeout = os.environ.get("XYZ_COMPAT_TIMEOUT")
-                                if timeout:
-                                    try:
-                                        timeout = float(timeout)
-                                    except Exception:
-                                        timeout = None
-                                if timeout:
-                                    start = time.time()
-                                    result = None
-                                    while True:
-                                        result = try_engines()
-                                        if result is not None: break
-                                        if (time.time() - start) >= timeout: break
-                                        time.sleep(0.5)
-                                else:
-                                    try_engines()
-                            except Exception as e:
-                                # If not IDE and not forced-ignore, let exception propagate (so users see it).
-                                if not (ide_debug or ide_env or force_ignore):
-                                    raise
-                                print("[COMPAT] Suppressed exception during compatibility run:", e)
-                            finally:
-                                # If requested by environment, ensure exit code 0 to satisfy IDE/run configurations.
-                                if os.environ.get("XYZ_ALWAYS_EXIT_0", "0") == "1" or ide_env or force_ignore:
-                                    try:
-                                        print("[COMPAT] Exiting with code 0 (IDE compatibility).")
-                                        sys.exit(0)
-                                    except SystemExit:
-                                        pass
-                                    # AdvancedEngine: JIT Compiler + Profiler + Optimizer
-                                    import threading
-                                    import time
-                                    from typing import Dict, Optional
-                                    # Advanced Engine: JIT Compiler + Profiler + Optimizer
-
-                                    # VS & Python compatibility runner (append to file)
-                                    # - Silences warnings, installs a tolerant excepthook, and attempts multiple engines until one succeeds.
-                                    # - When running inside an IDE/debugger (sys.gettrace) or when XYZ_IGNORE_ERRORS=1 or --ignore-errors
-                                    #   it will ignore engine failures and continue; it can also force exit code 0 via XYZ_ALWAYS_EXIT_0=1.
-                                    import warnings, sys, os, traceback, time
-
-                                    def _install_compat_runner():
-                                        warnings.filterwarnings("ignore")
-
-                                        def _safe_excepthook(exc_type, exc, tb):
-                                            # Print error but don't abort IDE-hosted runs unless explicitly configured.
-                                            try:
-                                                print("[COMPAT] Uncaught exception:", exc_type.__name__, exc, file=sys.stderr)
-                                                traceback.print_exception(exc_type, exc, tb)
-                                            except Exception:
-                                                pass
-                                            # do not call default hook - swallow
-                                    sys.excepthook = _safe_excepthook
-
-                                    ide_debug = bool(sys.gettrace())
-                                    ide_env = any(k for k in os.environ.keys() if "VISUAL" in k.upper() or "VSCODE" in k.upper())
-                                    force_ignore = os.environ.get("XYZ_IGNORE_ERRORS", "0") == "1" or "--ignore-errors" in sys.argv
-
-                                    def _read_src():
-                                        # prefer CLI filename argument
-                                        if len(sys.argv) > 1 and os.path.isfile(sys.argv[1]):
-                                            return open(sys.argv[1], "r", encoding="utf-8").read()
-                                        # try known default main sources
-                                        for cand in ("main.xy", "main.xyz", "input.xy", "input.xyz"):
-                                            if os.path.isfile(cand):
-                                                return open(cand, "r", encoding="utf-8").read()
-                                        return ""
-
-                                    def try_engines(entry="main/0", src_text: str = None):
-                                        src_text = src_text or _read_src()
-                                        attempts = []
-                                        last_exc = None
-
-                                        # Ordered, best-effort attempts. Each may raise; we catch and continue when allowed.
-                                        engines = [
-                                            ("ProCompiler", lambda: ProCompiler.pro_compile_and_run(src_text, entry=entry)),
-                                            ("compile_and_run_xyz", lambda: compile_and_run_xyz(src_text, emit_obj=False, emit_asm=False, run=True)),
-                                            ("UCompiler", lambda: UCompiler.run_source(src_text, entry=entry.split("/")[0])),
-                                            ("grand_resolve", lambda: grand_resolve_and_execute()),
-                                            ("main()", lambda: (main() if callable(globals().get("main")) else None)),
-                                        ]
-
-                                        for name, fn in engines:
-                                            try:
-                                                print(f"[COMPAT] Trying engine: {name}")
-                                                res = fn()
-                                                print(f"[COMPAT] Engine {name} succeeded -> {res!r}")
-                                                return res
-                                            except Exception as e:
-                                                last_exc = e
-                                                # Always log full trace for diagnostics
-                                                print(f"[COMPAT] Engine {name} failed:")
-                                                traceback.print_exc()
-                                                # If running in IDE/debugger or force_ignore, continue trying other engines
-                                                if ide_debug or ide_env or force_ignore:
-                                                    print(f"[COMPAT] Ignoring failure of {name} due to IDE/force-ignore.")
-                                                    continue
-                                                # Otherwise re-raise to signal failure
-                                                raise
-
-                                        print("[COMPAT] All engines attempted; none succeeded." + (f" Last error: {last_exc}" if last_exc else ""))
-                                        return None
-
-                                    return ide_debug, ide_env, force_ignore, try_engines
-
-                                    # Auto-run compatibility runner when executed directly.
-                                    if __name__ == "__main__":
-                                        try:
-                                            ide_debug, ide_env, force_ignore, try_engines = _install_compat_runner()
-                                            # allow optional timeout via env var (seconds)
-                                            timeout = os.environ.get("XYZ_COMPAT_TIMEOUT")
-                                            if timeout:
-                                                try:
-                                                    timeout = float(timeout)
-                                                except Exception:
-                                                    timeout = None
-                                            if timeout:
-                                                start = time.time()
-                                                result = None
-                                                while True:
-                                                    result = try_engines()
-                                                    if result is not None: break
-                                                    if (time.time() - start) >= timeout: break
-                                                    time.sleep(0.5)
-                                            else:
-                                                try_engines()
-                                        except Exception as e:
-                                            # If not IDE and not forced-ignore, let exception propagate (so users see it).
-                                            if not (ide_debug or ide_env or force_ignore):
-                                                raise
-                                            print("[COMPAT] Suppressed exception during compatibility run:", e)
-                                        finally:
-                                            # If requested by environment, ensure exit code 0 to satisfy IDE/run configurations.
-                                            if os.environ.get("XYZ_ALWAYS_EXIT_0", "0") == "1" or ide_env or force_ignore:
-                                                try:
-                                                    print("[COMPAT] Exiting with code 0 (IDE compatibility).")
-                                                    sys.exit(0)
-                                                except SystemExit:
-                                                    pass
-            from types import SimpleNamespace
-# Redirected here to avoid circular imports — safely integrate new execution properties
-# Hot-swap example for an updated engine (guidance only, actual use may vary)
-def fast_example_hot_swap():
-    key = "example_func/0"
-    src = '''
-func example_func() {
-  print("Hello, world!");
-}
-'''
-    print("[EXAMPLE] Hot-swapping new implementation for", key)
-    # Direct source replacement (for illustration, actual may vary)
-    globals().get("fast_rt").hot.swap(key, FuncDef("example_func", [], [Return()]))
-
-    # or via source/checkout integration
-    import json
-    snapshot = json.loads(open("mega_snapshot.json", "r", encoding="utf-8").read())
-    if "hot_funcs" in snapshot:
-        for k, sf in snapshot["hot_funcs"].items():
-            fd = deserialize_funcdef(sf)
-            fast_rt.hot.swap(k, fd)
-
-# ---- Installation and packaging (Docker, GitHub CI, etc.) ----
-# Simple examples: improve as needed for actual project layout and requirements
-def install_ci_cd_examples(workdir="."):
-    try:
-        # Dockerfile: very minimal example, adjust to match actual runtime and dependencies
-        with open(os.path.join(workdir, "Dockerfile"), "w", encoding="utf-8") as df:
-            df.write("FROM python:3.10-slim\nWORKDIR /app\nCOPY . /app\nRUN pip install --no-cache-dir -r requirements.txt\nCMD [\"python\", \"-m\", \"xyz_practice\"]\n")
-        with open(os.path.join(workdir, ".github", "workflows", "python-app.yml"), "w", encoding="utf-8") as wf:
-            wf.write("name: Python application\non: [push, pull_request]\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - name: Checkout\n        uses: actions/checkout@v2\n      - name: Set up Python\n        uses: actions/setup-python@v2\n        with:\n          python-version: '3.10'\n      - name: Install dependencies\n        run: |\n          python -m pip install --upgrade pip\n          pip install -r requirements.txt\n      - name: Test with pytest\n        run: |\n          pytest tests/\n")
-        print("[INSTALL] CI/CD example config written")
-    except Exception as e:
-        print("[INSTALL] Error writing CI/CD example:", e)
-        _ERROR_REPORTER.report(e, "install_ci_cd_examples")
-
-# EOF
-
-# XYZ Practice — Code Overview and Reference
-
-Plan (pseudocode / detailed plan)
-- Read the provided `xyz_practice.py` source and extract major modules and public APIs.
-- For each module/class/function:
-  - Describe responsibility, key fields, and common usage.
-  - Provide input/output expectations and examples where helpful.
-- Document CLI entry points and environment flags that change behavior.
-- Document runtime wiring (hot-swap, FastRuntime, MiniRuntime, ProCompiler) and fallback order.
-- Describe file formats emitted (`.obj` JSON, `.asm`, `.pkt`) and their structure.
-- Provide hot-swap server JSON protocol examples.
-- Provide quick code snippets demonstrating:
-  - Enabling mega features
-  - Running the `grand_resolve_and_execute` flow
-  - Using `FastRuntime` and `MiniRuntime`
-  - Performing hot-swap via server and API
-- Add safety and compatibility notes (timeouts, sandboxing, env flags).
-- Produce concise reference tables for important functions: `list_add`, `enable_mega_features`, `rapid_checkout_snapshot`, `compile_and_run_xyz`, `UCompiler.run_source`.
-- End with "Where to look in code" mapping to major classes and functions.
-
-Overview
-- File purpose: a single-file research compiler/runtime playground that demonstrates a layered pipeline:
-  - ProCompiler: professional parser → typechecker → IR → ExecutionEngine
-  - Legacy parser + Codegen → emit assembly, object and link; runtimes that execute the AST or compiled bytecode
-  - FastRuntime: bytecode compiler + FastVM for efficient execution and inline caching
-  - MiniRuntime: AST interpreter for robust fallback and hot-swap demo
-  - AdvancedEngine: optional JIT + profiler + optimizer that can register native callables
-- Safety: `grand_resolve_and_execute` only runs when `XYZ_GRAND_EXECUTE=1` or forced via CLI flags. Many features are opt-in.
-
-Key Concepts and Quick Reference
-
-- Type and Struct Registry
-  - `MegaType` and `TypeRegistry`
-    - Register and query language-level types: `TypeRegistry.register(MegaType("Float64"))`
-  - `StructDef` and `StructRegistry`
-    - Declare runtime struct layouts and create boxed instances:
-      - `StructRegistry.register(StructDef("Point2D", [("x","Float64"),("y","Float64")]))`
-      - `make_struct_instance("Point2D", x=1.0, y=2.0)`
-
-- MacroEngine and SelfExpander
-  - `MacroEngine.register_macro(name, fn)` registers expansion functions that map `Call` AST nodes to new AST fragments.
-  - `SelfExpander` can synthesize `FuncDef` objects and register them into `HotSwapRegistry` and `symtab`.
-  - Example: `SelfExpander.generate_vector_ops("Vec3", dims=3)` creates `Vec3.new` and `Vec3.add`.
-
-- Rapid checkout
-  - `rapid_checkout_snapshot(symtab, hot, path)` writes a minimal JSON snapshot containing keys and serialized bodies.
-  - `rapid_checkout_restore(path, symtab, hot)` restores stubbed `FuncDef` placeholders to the hot registry.
-
-- Primitive helpers
-  - `list_add(a, b)` — element-wise list addition with basic type-fallthrough; used by `enable_mega_features`.
-  - Safer recursive `list_add` variant exists later in file with numeric, string and nested-list handling.
-
-- Enabling Mega Features
-  - `enable_mega_features(hot_registry, mini_runtime, fast_runtime=None)`:
-    - Registers example structs
-    - Injects `list_add` as builtin into `MiniRuntime._mega_builtins`
-    - Patches `MiniRuntime.eval` to consult `_mega_builtins` first for `Call` nodes
-    - Optionally registers native `list_add` into `FastVM.globals`
-  - `mega_demo_enable(symtab, hot_registry, mini_runtime, fast_runtime=None)` runs an expander and snapshots state to `mega_snapshot.json`.
-
-Execution Pipelines
-
-1. ProCompiler (recommended path)
-   - Components:
-     - `ProLexer` → tokens
-     - `ProParser` → `PProgram` (Pro AST)
-     - `TypeChecker` → semantic checks and simple inference
-     - `IRBuilder` → lowers `PProgram` to IR (`IRInstr` with `IROp`)
-     - `ExecutionEngine` → executes IR with SSA-like temp mapping
-   - Invocation: `ProCompiler.pro_compile_and_run(source, entry="main/0")`
-
-2. Legacy pipeline + Codegen
-   - `lex(src)` tokenizes into `Token` objects consumed by `Parser` (legacy).
-   - `Parser` produces AST with `FuncDef`, `Call`, `ListLiteral`, `TryCatch`, `Parallel` etc.
-   - `Codegen.generate(ast, emit_pkt=False)` emits annotated assembly lines and packs them into a dodecagram `.pkt`.
-   - `Codegen.emit_object(asm, path)` writes a JSON "object" representing symbols.
-   - `Codegen.link_objects([objs], out_asm)` merges objects and emits final assembly.
-
-3. FastRuntime (bytecode + FastVM)
-   - `FastCompiler` compiles small subset AST to `BytecodeFunction` objects.
-   - `FastVM` executes bytecode with stack, locals and inline caches.
-   - `FastRuntime` is a facade that wires the compiler, pool and VM.
-   - Call resolution order: hot registry → compiled bytecode → native mapping (`print`, `alloc`) → interpreted wrapper.
-
-4. MiniRuntime (fallback interpreter)
-   - Interprets `FuncDef` objects and AST nodes:
-     - Frames stack, closures (`Closure`), builtins (`alloc`,`free`,`mutex`,`parallel`,`print`)
-   - Hot-swap integration: `HotSwapRegistry` returns latest `FuncDef` for a function key.
-   - `MiniRuntime.run_func("main/0", [])` executes a registered function.
-
-Hot-Swap Registry and Server
-- `HotSwapRegistry` stores `FuncDef` keyed by `"name/arity"`.
-  - `register(key, func)`, `get(key)`, `swap(key, new_func)` (thread-safe).
-- `HotSwapServer(host, port, hot_registry)` listens on TCP for JSON payloads:
-  - Example payloads:
-    - Swap: `{"op":"swap","key":"main/0","type":"const_return","value":123}`
-    - List: `{"op":"list"}`
-  - Server returns JSON responses and registers swapped `FuncDef` objects.
-
-Object / Linker Formats
-- Object JSON written by `write_object_from_asm(asm_text, obj_path)`:
-  - Fields: `format: "XYZOBJ1"`, `symbols: {symbol: [asm_lines...]}`, `raw: asm_text`.
-- `link_objects_to_asm(obj_paths, out_asm_path, externs)`:
-  - Concatenates symbols, emits `extern` directives for libc mappings, and appends raw traces as comments.
-
-Dodecagram Packing
-- `dodecagram_pack_stream(asm: str)` encodes assembly into a base12-packed bytestring with header `DDG1` and 4-byte length.
-
-CLI and Hooks
-- `main()` function:
-  - CLI flags: `--link`, `--emit-asm`, `--emit-pkt`, `--hot-swap-demo`, `--hot-swap-server`.
-  - Loads primary file, optionally links others, registers functions into `HotSwapRegistry`.
-  - Runs `Codegen.generate`, optionally writes `out.asm`.
-  - Instantiates `MiniRuntime` for demos, can hot-swap `main/0` in-memory and run before/after.
-  - If `--hot-swap-server` provided, starts persistent `HotSwapServer`.
-
-Grand Resolve and Execution
-- `grand_resolve_and_execute()`:
-  - Controlled by env `XYZ_GRAND_EXECUTE=1` or helper force flags.
-  - Strategy:
-    - Try `ProCompiler.pro_compile_and_run`
-    - Fallback to legacy pipeline + `FastRuntime`
-    - Final fallback: `MiniRuntime`
-  - Emits diagnostic prints and traceback on failure.
-  - Registered with `atexit.register` to run on program exit if enabled.
-
-Advanced Engine: Optimizer, TypeInfer, JIT
-- `SSAOptimizer` and `TypeInfer` operate on IR for const-folding, dead-code-elim, and lightweight inference.
-- `JITCompiler` attempts to translate small `FuncDef` bodies to native Python callables and registers them for `FastVM` or `MiniRuntime`:
-  - `JITCompiler.jit_compile(key)` builds Python source, `exec`, and registers native callable.
-- `AdvancedEngine` wraps runtimes to profile and trigger JIT compilation after thresholds.
-
-Notable Utilities and Safety Notes
-- Memory and GC:
-  - Several `MemoryPool` variants and a simple refcount `SimpleGC` are provided for experimentation.
-- `venv_runner.py` wrappers:
-  - Scripts to create isolated venvs and run the target script under suppression; designed for IDE/CI tolerant flows.
-- Error handling:
-  - Many parts are defensive but may raise `Exception` for misuse; `grand_resolve_and_execute` returns structured diagnostics now.
-- Strings and Lexer:
-  - `STRING_PATTERN` improvements exist to support escaped quotes; file contains both legacy and improved patterns in comments.
-
-Examples
-
-1) Run ProCompiler on a source string:
-
-    src = '''
-    func main() {
-        print("Hello from ProCompiler!");
-        return 0;
-        }
-        ProCompiler.pro_compile_and_run(src, entry="main/0")
-        '''
-        2) Enable mega features and run a demo:
-        hot_registry = HotSwapRegistry()
-        mini_runtime = MiniRuntime(hot_registry)
-        enable_mega_features(hot_registry, mini_runtime)
-        mega_demo_enable({}, hot_registry, mini_runtime)
-        import os
-        os
-        .remove("mega_snapshot.json")  # cleanup demo snapshot
-        '''
-        3) Start a hot-swap server:
-        hot_registry = HotSwapRegistry()
-        server = HotSwapServer("localhost", 9000, hot_registry)
-        server.start()
-        '''
-
-# Removed stray duplicate parser/typecheck snippet (it introduced unmatched tokens/parenthesis).
-# If you need to parse & typecheck a UProgram here, call `UCompiler.run_source(src)` or
-# invoke the intended pipeline in a controlled location. This placeholder avoids syntax errors.
-pass
-
-            return ide_debug, ide_env, force_ignore, try_engines
-
-                        def _read_src():
-                            # prefer CLI filename argument
-                            if len(sys.argv) > 1 and os.path.isfile(sys.argv[1]):
-                                return open(sys.argv[
-                                1], "r", encoding="utf-8").read()
-                                # try known default main sources
-                                for cand in ("main.xy", "main.xyz", "input.xy", "input.xyz"):
-                                    if os.path.isfile(cand):
-                                        return open(cand, "r", encoding="utf-8").read()
-                                        return ""
-                                        def try_engines(entry="main/0", src_text: str = None):
-                                        src_text = src_text or _read_src()
-                                        attempts = []
-                                        last_exc = None
-                                        # Ordered, best-effort attempts. Each may raise; we catch and continue when allowed.
-                                        engines = [
-                                            ("ProCompiler", lambda: ProCompiler.pro_compile_and_run(src_text, entry=entry)),
-                                            ("compile_and_run_xyz", lambda: compile_and_run_xyz(src_text, emit_obj=False, emit_asm=False, run=True)),
-                                            ("UCompiler", lambda: UCompiler.run_source(src_text, entry=entry.split("/")[0])),
-                                            ("grand_resolve", lambda: grand_resolve_and_execute()),
-                                            ("main()", lambda: (main() if callable(globals().get("main")) else None)),
-                                            ]
-                                            for name, fn in engines:
-                                            try:
-                                                print(f"[COMPAT] Trying engine: {name}")
-                                                res = fn()
-                                                print(f"[COMPAT] Engine {name} succeeded -> {res!r}")
-                                                return res
-                                                except Exception as e:
-                                                last_exc = e
-                                                # Always log full trace for diagnostics
-
-                                                print(f"[COMPAT] Engine {name} failed:"); traceback.print_exc()
-                                                # If running in IDE/debugger or force_ignore, continue trying other engines
-
-                                            if ide_debug or ide_env or force_ignore:
-                                                print(f"[COMPAT] Ignoring failure of {name} due to IDE/force-ignore.")
-                                                continue
-                                                # Otherwise re-raise to signal failure
-                                                raise
-                                                print("[COMPAT] All engines attempted; none succeeded." + (f" Last error: {last_exc}" if last_exc else ""))
-                                                return None
+    ""
