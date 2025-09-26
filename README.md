@@ -723,3 +723,9 @@ This pattern is more similar to conventional languages:
 
 - Both are valid XYZ patterns for printing "Hello, world" and running the program.
 - The choice of entry point (`Start()` vs. `main()`), literal style (`{}` vs. `[]`), and execution command (`run` vs. `start`) depends on convention, preference, or subtle semantic differences.
+
+## _____
+
+set XYZ_GRAND_EXECUTE=1
+python XYZC7.py hello.xy
+
